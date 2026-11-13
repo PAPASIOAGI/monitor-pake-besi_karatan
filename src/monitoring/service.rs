@@ -53,6 +53,10 @@ impl MonitoringService {
             .try_send(MonitorCommand::SetInterval(interval));
     }
 
+    pub fn set_paused(&self, paused: bool) {
+        let _ = self.command_tx.try_send(MonitorCommand::SetPaused(paused));
+    }
+
     pub fn shutdown(&mut self) {
         let _ = self.command_tx.send(MonitorCommand::Shutdown);
         if let Some(handle) = self.worker.take() {
@@ -75,12 +79,13 @@ fn run_worker(
     initial_interval: Duration,
 ) {
     let mut interval = initial_interval;
+    let mut paused = false;
     let mut sequence: u64 = 0;
     let mut next_tick = Instant::now();
 
     loop {
         let now = Instant::now();
-        if now >= next_tick {
+        if now >= next_tick && !paused {
             sequence = sequence.wrapping_add(1);
             match collector.collect(sequence) {
                 Ok(snapshot) => {
@@ -104,6 +109,10 @@ fn run_worker(
         match command_rx.recv_timeout(Duration::from_millis(10)) {
             Ok(MonitorCommand::SetInterval(d)) => {
                 interval = d;
+                next_tick = Instant::now();
+            }
+            Ok(MonitorCommand::SetPaused(value)) => {
+                paused = value;
                 next_tick = Instant::now();
             }
             Ok(MonitorCommand::Shutdown) => break,

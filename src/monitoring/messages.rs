@@ -5,6 +5,7 @@ use crate::domain::SystemSnapshot;
 #[derive(Debug)]
 pub enum MonitorCommand {
     SetInterval(Duration),
+    SetPaused(bool),
     Shutdown,
 }
 

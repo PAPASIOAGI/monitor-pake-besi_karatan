@@ -9,6 +9,7 @@ pub fn show(ui: &mut Ui, config: &mut AppConfig, actions: &mut UiActions) {
     ui.add_space(12.0);
 
     let prev_interval = config.sampling_interval_ms;
+    let prev_theme = config.theme;
 
     egui::Grid::new("settings_grid").show(ui, |ui| {
         ui.label("Sampling interval (ms)");
@@ -56,6 +57,9 @@ pub fn show(ui: &mut Ui, config: &mut AppConfig, actions: &mut UiActions) {
 
     if config.sampling_interval_ms != prev_interval {
         actions.new_interval_ms = Some(config.sampling_interval_ms);
+    }
+    if config.theme != prev_theme {
+        actions.theme_changed = true;
     }
 
     ui.add_space(16.0);

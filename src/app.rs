@@ -13,6 +13,7 @@ pub struct MonitorApp {
     latest: Option<SystemSnapshot>,
     history: AppHistory,
     active_page: ui::Page,
+    paused: bool,
 }
 
 struct AppHistory {
@@ -36,7 +37,8 @@ impl MonitorApp {
                 ram: HistoryBuffer::new(capacity),
                 gpu: HistoryBuffer::new(capacity),
             },
-            active_page: ui::Page::Dashboard,
+            active_page: ui::Page::Overview,
+            paused: false,
         }
     }
 }
@@ -64,9 +66,17 @@ impl eframe::App for MonitorApp {
             &self.history.ram,
             &self.history.gpu,
             &mut self.config,
+            self.paused,
         );
         if let Some(ms) = actions.new_interval_ms {
             self.service.set_interval(Duration::from_millis(ms));
+        }
+        if let Some(paused) = actions.paused {
+            self.paused = paused;
+            self.service.set_paused(paused);
+        }
+        if actions.theme_changed {
+            apply_theme(ctx, &self.config);
         }
 
         ctx.request_repaint_after(Duration::from_millis(100));
@@ -79,8 +89,5 @@ impl eframe::App for MonitorApp {
 }
 
 fn apply_theme(ctx: &egui::Context, config: &AppConfig) {
-    match config.theme {
-        crate::config::ThemeChoice::Dark => ctx.set_visuals(egui::Visuals::dark()),
-        crate::config::ThemeChoice::Light => ctx.set_visuals(egui::Visuals::light()),
-    }
+    ui::apply_theme(ctx, config.theme == crate::config::ThemeChoice::Light);
 }

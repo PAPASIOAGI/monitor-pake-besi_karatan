@@ -2,20 +2,18 @@ use std::collections::VecDeque;
 
 #[derive(Debug, Clone)]
 pub struct HistoryBuffer {
-    capacity: usize,
     entries: VecDeque<f32>,
 }
 
 impl HistoryBuffer {
     pub fn new(capacity: usize) -> Self {
         Self {
-            capacity: capacity.max(2),
             entries: VecDeque::with_capacity(capacity.max(2)),
         }
     }
 
     pub fn push(&mut self, value: f32) {
-        if self.entries.len() >= self.capacity {
+        if self.entries.len() >= self.entries.capacity() {
             self.entries.pop_front();
         }
         self.entries.push_back(value);
@@ -25,8 +23,22 @@ impl HistoryBuffer {
         self.entries.iter()
     }
 
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+
+    pub fn value_at_x(&self, rect: egui::Rect, x: f32) -> Option<f32> {
+        if self.entries.is_empty() || rect.width() <= 0.0 {
+            return None;
+        }
+        let ratio = ((x - rect.left()) / rect.width()).clamp(0.0, 1.0);
+        let index = (ratio * (self.entries.len() - 1) as f32).round() as usize;
+        self.entries.get(index).copied()
     }
 }
 

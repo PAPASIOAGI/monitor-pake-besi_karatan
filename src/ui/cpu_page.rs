@@ -1,50 +1,75 @@
-use egui::Ui;
+use egui::{RichText, Ui};
 
 use crate::domain::SystemSnapshot;
 
-pub fn show(ui: &mut Ui, snapshot: Option<&SystemSnapshot>) {
-    ui.heading("CPU");
-    ui.add_space(8.0);
+use super::theme;
+use super::widgets::{panel, section_heading, usage_bar};
 
+pub fn show(ui: &mut Ui, snapshot: Option<&SystemSnapshot>, threshold: f32) {
     let Some(snap) = snapshot else {
-        ui.label("No data yet.");
+        ui.label("Collecting first sample…");
         return;
     };
     let cpu = &snap.cpu;
 
     ui.horizontal_wrapped(|ui| {
-        ui.label(format!("Name: {}", cpu.name));
-        ui.separator();
-        ui.label(format!(
-            "Physical cores: {} | Logical processors: {} | Sockets: {}",
-            cpu.physical_cores, cpu.logical_processors, cpu.sockets
-        ));
-        ui.separator();
-        ui.label(format!("Active cores: {}", cpu.active_cores));
+        ui.label(RichText::new(&cpu.name).size(16.0).strong());
+        ui.label(
+            RichText::new(format!(
+                "{} physical cores · {} logical processors · {} sockets",
+                cpu.physical_cores, cpu.logical_processors, cpu.sockets
+            ))
+            .color(theme::SECONDARY),
+        );
     });
-
-    ui.add_space(8.0);
-    ui.label(format!("Total utilization: {:.1}%", cpu.total_utilization));
-    if let (Some(base), Some(cur)) = (cpu.base_clock_mhz, cpu.current_clock_mhz) {
-        ui.label(format!("Clock: {cur} MHz (base {base} MHz)"));
-    }
-
-    ui.add_space(12.0);
-    ui.separator();
-    ui.label("Per logical processor:");
-
-    egui::ScrollArea::vertical().show(ui, |ui| {
-        egui::Grid::new("cpu_grid").striped(true).show(ui, |ui| {
-            ui.label("LP");
-            ui.label("Core");
-            ui.label("Usage");
-            ui.end_row();
-            for lp in &cpu.per_logical {
-                ui.label(format!("{}", lp.index));
-                ui.label(format!("{}", lp.physical_core_index));
-                ui.label(format!("{:.1}%", lp.utilization));
-                ui.end_row();
+    ui.add_space(16.0);
+    ui.columns(2, |columns| {
+        panel(&mut columns[0], |ui| {
+            section_heading(ui, "Utilization");
+            ui.label(RichText::new(format!("{:.1}%", cpu.total_utilization)).size(36.0).strong());
+            usage_bar(ui, cpu.total_utilization / 100.0, theme::ACCENT);
+            ui.add_space(8.0);
+            ui.label(RichText::new(format!("{} active cores", cpu.active_cores)).color(theme::SECONDARY))
+                .on_hover_text(format!("A physical core is active when at least one logical processor exceeds {threshold:.0}% utilization."));
+        });
+        panel(&mut columns[1], |ui| {
+            section_heading(ui, "Clock");
+            match (cpu.current_clock_mhz, cpu.base_clock_mhz) {
+                (Some(current), Some(base)) => {
+                    ui.label(RichText::new(format!("{current} MHz")).size(28.0).strong());
+                    ui.label(RichText::new(format!("Base clock {base} MHz")).color(theme::SECONDARY));
+                }
+                _ => { ui.label(RichText::new("N/A").size(28.0).color(theme::MUTED)); }
             }
         });
+    });
+    ui.add_space(16.0);
+    panel(ui, |ui| {
+        section_heading(ui, "Logical processors");
+        ui.label(
+            RichText::new("Grouped by physical core")
+                .size(12.0)
+                .color(theme::MUTED),
+        );
+        ui.add_space(12.0);
+        egui::Grid::new("logical_processor_grid")
+            .num_columns(3)
+            .spacing([24.0, 12.0])
+            .show(ui, |ui| {
+                for logical in &cpu.per_logical {
+                    ui.label(
+                        RichText::new(format!("Core {}", logical.physical_core_index))
+                            .color(theme::MUTED),
+                    );
+                    ui.label(format!("LP {}", logical.index));
+                    ui.horizontal(|ui| {
+                        usage_bar(ui, logical.utilization / 100.0, theme::ACCENT);
+                        ui.label(
+                            RichText::new(format!("{:5.1}%", logical.utilization)).monospace(),
+                        );
+                    });
+                    ui.end_row();
+                }
+            });
     });
 }
