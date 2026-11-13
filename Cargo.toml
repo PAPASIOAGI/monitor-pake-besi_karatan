@@ -1,0 +1,25 @@
+[package]
+name = "monitor"
+version = "0.1.0"
+edition = "2024"
+description = "Windows PC Monitor - CPU, RAM, GPU, Storage"
+license = "MIT"
+
+[dependencies]
+eframe = "0.32"
+egui = "0.32"
+crossbeam-channel = "0.5"
+serde = { version = "1", features = ["derive"] }
+toml = "0.9"
+directories = "6"
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = true
