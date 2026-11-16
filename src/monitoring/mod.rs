@@ -1,4 +1,4 @@
-mod collector;
+pub mod collector;
 mod history;
 mod messages;
 mod mock;
