@@ -1,248 +1,325 @@
-use std::ffi::OsStr;
-use std::os::windows::ffi::OsStrExt;
+use std::collections::BTreeMap;
+use std::mem::size_of;
 
-use windows::Win32::Foundation::WIN32_ERROR;
+use serde::Deserialize;
+use windows::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, WIN32_ERROR};
+use windows::Win32::System::Registry::{HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ, RegGetValueW};
 use windows::Win32::System::SystemInformation::{
-    GetLogicalProcessorInformationEx, GetSystemInfo,
-    LOGICAL_PROCESSOR_RELATIONSHIP, RelationProcessorCore,
-    SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX, SYSTEM_INFO,
+    GetLogicalProcessorInformationEx, LOGICAL_PROCESSOR_RELATIONSHIP, RelationAll,
+    RelationProcessorCore, RelationProcessorPackage, SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX,
 };
-use windows::Win32::System::Registry::{
-    RegOpenKeyExW, RegQueryValueExW, RegCloseKey, HKEY, KEY_READ,
-    HKEY_LOCAL_MACHINE, REG_SZ, REG_VALUE_TYPE,
-};
+use windows::core::PCWSTR;
 
-use crate::domain::cpu::{CpuSnapshot, LogicalProcessorUsage};
+use crate::domain::{CpuSnapshot, LogicalProcessorUsage};
 use crate::error::CollectorError;
-use crate::platform::windows::pdh::{PdhQuery, PdhCounter};
+use crate::platform::windows::pdh::{PdhCounter, PdhQuery};
+
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct WmiProcessor {
+    name: Option<String>,
+    manufacturer: Option<String>,
+    max_clock_speed: Option<u32>,
+}
+
+struct Topology {
+    cores: Vec<Vec<u32>>,
+    logical_count: u32,
+    sockets: u32,
+}
 
 pub struct CpuCollector {
     query: PdhQuery,
-    total_counter: PdhCounter,
-    per_core_counters: Vec<PdhCounter>,
-    logical_count: u32,
-    physical_count: u32,
-    sockets: u32,
-    core_to_logical: Vec<Vec<u32>>,
+    total: PdhCounter,
+    logical: Option<PdhCounter>,
+    performance: Option<PdhCounter>,
+    topology: Topology,
     name: String,
-    initialized: bool,
+    vendor: String,
+    base_clock_mhz: Option<u32>,
 }
 
 impl CpuCollector {
     pub fn new() -> Result<Self, CollectorError> {
-        let (logical_count, physical_count, sockets, core_to_logical, name) = Self::get_topology()?;
-        
         let query = PdhQuery::new()?;
-        
-        let total_counter = query.add_counter(r"\Processor Information(_Total)\% Processor Utility")?;
-        
-        let mut per_core_counters = Vec::new();
-        for i in 0..logical_count {
-            let path = format!(r"\Processor Information({},{})\% Processor Utility", i, i);
-            match query.add_counter(&path) {
-                Ok(c) => per_core_counters.push(c),
-                Err(_) => break,
-            }
-        }
-
+        let total = query.add_counter(r"\Processor Information(_Total)\% Processor Utility")?;
+        let logical = query
+            .add_counter(r"\Processor Information(*)\% Processor Utility")
+            .ok();
+        let performance = query
+            .add_counter(r"\Processor Information(_Total)\% Processor Performance")
+            .ok();
+        let topology = read_topology()?;
+        let identity = read_identity();
         Ok(Self {
             query,
-            total_counter,
-            per_core_counters,
-            logical_count,
-            physical_count,
-            sockets,
-            core_to_logical,
-            name,
-            initialized: false,
+            total,
+            logical,
+            performance,
+            topology,
+            name: identity.0,
+            vendor: identity.1,
+            base_clock_mhz: identity.2,
         })
-    }
-
-    fn get_topology() -> Result<(u32, u32, u32, Vec<Vec<u32>>, String), CollectorError> {
-        let mut return_length = 0u32;
-        
-        let result = unsafe {
-            GetLogicalProcessorInformationEx(RelationProcessorCore, None, &mut return_length)
-        };
-        
-        if result != 0 && return_length == 0 {
-            return Err(CollectorError::Windows("GetLogicalProcessorInformationEx returned 0 length".into()));
-        }
-
-        let mut buffer = vec![0u8; return_length as usize];
-        
-        let result = unsafe {
-            GetLogicalProcessorInformationEx(
-                RelationProcessorCore,
-                Some(buffer.as_mut_ptr() as *mut _),
-                &mut return_length,
-            )
-        };
-        
-        if result == 0 {
-            return Err(CollectorError::Windows("GetLogicalProcessorInformationEx failed".into()));
-        }
-
-        let mut physical_cores = 0u32;
-        let mut core_to_logical = Vec::new();
-        let mut offset = 0usize;
-        
-        while offset < return_length as usize {
-            let info = unsafe { &*(buffer.as_ptr().add(offset) as *const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX) };
-            
-            if info.Relationship == RelationProcessorCore {
-                let processor_core = unsafe { &info.Anonymous.Processor };
-                let mask = processor_core.GroupMask[0].Mask;
-                let mut logicals = Vec::new();
-                
-                for i in 0..64 {
-                    if (mask as u64) & (1u64 << i) != 0 {
-                        logicals.push(i as u32);
-                    }
-                }
-                
-                if !logicals.is_empty() {
-                    physical_cores += 1;
-                    core_to_logical.push(logicals);
-                }
-            }
-            
-            offset += info.Size as usize;
-        }
-
-        let sockets = if physical_cores > 0 { 1 } else { 0 };
-        
-        let mut logical_count = 0u32;
-        for core in &core_to_logical {
-            logical_count += core.len() as u32;
-        }
-
-        let mut sys_info = SYSTEM_INFO::default();
-        unsafe { GetSystemInfo(&mut sys_info) };
-        
-        if logical_count == 0 {
-            logical_count = sys_info.dwNumberOfProcessors;
-        }
-
-        let name = Self::get_processor_name()?;
-        
-        Ok((logical_count, physical_cores, sockets, core_to_logical, name))
-    }
-
-    fn get_processor_name() -> Result<String, CollectorError> {
-        let subkey = "HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0";
-        let subkey_wide: Vec<u16> = OsStr::new(subkey).encode_wide().chain(Some(0)).collect();
-        
-        let mut key = HKEY::default();
-        let status = unsafe {
-            RegOpenKeyExW(
-                HKEY_LOCAL_MACHINE,
-                windows::core::PCWSTR(subkey_wide.as_ptr()),
-                Some(0),
-                KEY_READ,
-                &mut key,
-            )
-        };
-        
-        if status != WIN32_ERROR(0) {
-            return Ok("Unknown Processor".into());
-        }
-        
-        let value_name = "ProcessorNameString";
-        let value_name_wide: Vec<u16> = OsStr::new(value_name).encode_wide().chain(Some(0)).collect();
-        
-        let mut value_buffer = vec![0u8; 256];
-        let mut value_size = value_buffer.len() as u32;
-        let mut value_type = 0u32;
-        
-        let status = unsafe {
-            RegQueryValueExW(
-                key,
-                windows::core::PCWSTR(value_name_wide.as_ptr()),
-                None,
-                Some(&mut value_type as *mut u32),
-                Some(value_buffer.as_mut_ptr()),
-                Some(&mut value_size),
-            )
-        };
-        
-        let mut name = String::new();
-        if status == WIN32_ERROR(0) && value_type == REG_SZ.0 as u32 {
-            let wide_slice = unsafe { std::slice::from_raw_parts(value_buffer.as_ptr() as *const u16, (value_size / 2) as usize) };
-            name = String::from_utf16_lossy(wide_slice).trim_end_matches('\0').to_string();
-        }
-        
-        unsafe { RegCloseKey(key) };
-        
-        if name.is_empty() {
-            name = "Unknown Processor".into();
-        }
-        
-        Ok(name)
     }
 
     pub fn collect(&mut self) -> Result<CpuSnapshot, CollectorError> {
         self.query.collect()?;
-        
-        let total_util = self.total_counter.get_double()?.clamp(0.0, 100.0) as f32;
-        
-        let mut per_logical = vec![0.0f32; self.logical_count as usize];
-        
-        if self.per_core_counters.len() == self.logical_count as usize {
-            for (i, counter) in self.per_core_counters.iter().enumerate() {
-                if let Ok(val) = counter.get_double() {
-                    let util = val.clamp(0.0, 100.0) as f32;
-                    if i < self.core_to_logical.len() {
-                        for &lp in &self.core_to_logical[i] {
-                            if (lp as usize) < per_logical.len() {
-                                per_logical[lp as usize] = util;
-                            }
-                        }
-                    }
-                }
-            }
-        } else {
-            for i in 0..self.logical_count as usize {
-                per_logical[i] = total_util;
-            }
-        }
-        
-        let active_cores = if self.initialized {
-            self.core_to_logical.iter()
-                .filter(|core| {
-                    core.iter().any(|&lp| {
-                        (lp as usize) < per_logical.len() && per_logical[lp as usize] > 5.0
-                    })
-                })
-                .count() as u32
-        } else {
-            self.physical_count
-        };
+        let total = finite_percent(self.total.get_double().ok());
+        let performance = self
+            .performance
+            .as_ref()
+            .and_then(|counter| counter.get_double().ok())
+            .filter(|value| value.is_finite() && *value >= 0.0);
+        let current_clock_mhz = self
+            .base_clock_mhz
+            .and_then(|base| performance.map(|value| (base as f64 * value / 100.0).round() as u32));
 
-        self.initialized = true;
-
-        let logical_usage: Vec<LogicalProcessorUsage> = per_logical.iter().enumerate()
-            .map(|(i, &util)| {
-                let physical_core = self.core_to_logical.iter().position(|core| core.contains(&(i as u32)))
-                    .unwrap_or(i / 2) as u32;
-                LogicalProcessorUsage {
-                    index: i as u32,
-                    physical_core_index: physical_core,
-                    utilization: util,
-                }
+        let per_instance = self
+            .logical
+            .as_ref()
+            .and_then(|counter| counter.get_instance_values().ok())
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|(name, value)| {
+                let (group, number) = parse_processor_instance(&name)?;
+                Some(((group, number), finite_percent(Some(value))?))
             })
-            .collect();
+            .collect::<BTreeMap<_, _>>();
+
+        let per_logical = self
+            .topology
+            .cores
+            .iter()
+            .enumerate()
+            .flat_map(|(core_index, logicals)| {
+                let per_core = per_instance.clone();
+                logicals.iter().map(move |&index| {
+                    let group = index / usize::BITS;
+                    let number = index % usize::BITS;
+                    LogicalProcessorUsage {
+                        index,
+                        physical_core_index: core_index as u32,
+                        utilization: per_core.get(&(group, number)).copied(),
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        let active_cores = self
+            .topology
+            .cores
+            .iter()
+            .enumerate()
+            .filter(|(core, _)| {
+                per_logical
+                    .iter()
+                    .filter(|logical| logical.physical_core_index == *core as u32)
+                    .filter_map(|logical| logical.utilization)
+                    .any(|usage| usage > 5.0)
+            })
+            .count() as u32;
 
         Ok(CpuSnapshot {
             name: self.name.clone(),
-            total_utilization: total_util,
-            physical_cores: self.physical_count,
-            logical_processors: self.logical_count,
-            sockets: self.sockets,
+            vendor: self.vendor.clone(),
+            total_utilization: total,
+            physical_cores: self.topology.cores.len() as u32,
+            logical_processors: self.topology.logical_count,
+            sockets: self.topology.sockets,
             active_cores,
-            per_logical: logical_usage,
-            base_clock_mhz: None,
-            current_clock_mhz: None,
+            per_logical,
+            base_clock_mhz: self.base_clock_mhz,
+            current_clock_mhz,
         })
+    }
+}
+
+fn finite_percent(value: Option<f64>) -> Option<f32> {
+    value
+        .filter(|value| value.is_finite())
+        .map(|value| value.clamp(0.0, 100.0) as f32)
+}
+
+fn parse_processor_instance(value: &str) -> Option<(u32, u32)> {
+    let (group, number) = value.split_once(',')?;
+    Some((group.parse().ok()?, number.parse().ok()?))
+}
+
+fn read_topology() -> Result<Topology, CollectorError> {
+    let buffer = processor_information(RelationAll)?;
+    let mut cores = Vec::new();
+    let mut logical_count = 0;
+    let mut sockets = 0;
+    let mut offset = 0;
+    while offset < buffer.len() {
+        // SAFETY: Windows returns aligned variable-length records with a valid Size.
+        let info = unsafe {
+            &*buffer
+                .as_ptr()
+                .add(offset)
+                .cast::<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>()
+        };
+        if info.Size == 0 {
+            break;
+        }
+        if info.Relationship == RelationProcessorCore
+            || info.Relationship == RelationProcessorPackage
+        {
+            // SAFETY: the Relationship discriminator selects the Processor union member.
+            let processor = unsafe { &info.Anonymous.Processor };
+            let indices = processor_indices(info, processor.GroupCount, &processor.GroupMask[0]);
+            if info.Relationship == RelationProcessorPackage {
+                sockets += 1;
+            } else {
+                logical_count += indices.len() as u32;
+                cores.push(indices);
+            }
+        }
+        offset += info.Size as usize;
+    }
+    if cores.is_empty() {
+        return Err(CollectorError::Unavailable(
+            "Windows returned no physical processor cores".into(),
+        ));
+    }
+    Ok(Topology {
+        cores,
+        logical_count,
+        sockets,
+    })
+}
+
+fn processor_indices(
+    info: &SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX,
+    group_count: u16,
+    first: &windows::Win32::System::SystemInformation::GROUP_AFFINITY,
+) -> Vec<u32> {
+    // SAFETY: GroupMask is a flexible array with GroupCount entries in the record.
+    let masks = unsafe { std::slice::from_raw_parts(first, group_count as usize) };
+    let record_end = info as *const _ as usize + info.Size as usize;
+    let mut indices = Vec::new();
+    for affinity in masks {
+        if affinity as *const windows::Win32::System::SystemInformation::GROUP_AFFINITY as usize
+            + size_of::<windows::Win32::System::SystemInformation::GROUP_AFFINITY>()
+            > record_end
+        {
+            break;
+        }
+        for bit in 0..usize::BITS {
+            if affinity.Mask & (1_usize << bit) != 0 {
+                indices.push(affinity.Group as u32 * usize::BITS + bit);
+            }
+        }
+    }
+    indices
+}
+
+fn processor_information(
+    relationship: LOGICAL_PROCESSOR_RELATIONSHIP,
+) -> Result<Vec<u8>, CollectorError> {
+    let mut length = 0;
+    let error = unsafe { GetLogicalProcessorInformationEx(relationship, None, &mut length) }
+        .expect_err("the sizing call must request a buffer");
+    if error.code() != ERROR_INSUFFICIENT_BUFFER.to_hresult() || length == 0 {
+        return Err(CollectorError::Windows(format!(
+            "processor topology sizing failed: {error}"
+        )));
+    }
+    let mut buffer = vec![0_u8; length as usize];
+    unsafe {
+        GetLogicalProcessorInformationEx(
+            relationship,
+            Some(buffer.as_mut_ptr().cast()),
+            &mut length,
+        )
+    }
+    .map_err(|error| CollectorError::Windows(format!("processor topology failed: {error}")))?;
+    Ok(buffer)
+}
+
+fn read_identity() -> (String, String, Option<u32>) {
+    let wmi = wmi::WMIConnection::new()
+        .and_then(|connection| connection.query::<WmiProcessor>())
+        .ok()
+        .and_then(|rows| rows.into_iter().next());
+    let registry_name = registry_processor_name();
+    let name = wmi
+        .as_ref()
+        .and_then(|cpu| clean(&cpu.name))
+        .or(registry_name)
+        .unwrap_or_else(|| "N/A".into());
+    let vendor = wmi
+        .as_ref()
+        .and_then(|cpu| clean(&cpu.manufacturer))
+        .map(|vendor| match vendor.as_str() {
+            "AuthenticAMD" => "AMD".into(),
+            "GenuineIntel" => "Intel".into(),
+            other => other.into(),
+        })
+        .unwrap_or_else(|| "N/A".into());
+    let base_clock = wmi.and_then(|cpu| cpu.max_clock_speed);
+    (name, vendor, base_clock)
+}
+
+fn registry_processor_name() -> Option<String> {
+    let subkey = wide(r"HARDWARE\DESCRIPTION\System\CentralProcessor\0");
+    let value = wide("ProcessorNameString");
+    let mut bytes = 0;
+    let status = unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            PCWSTR(subkey.as_ptr()),
+            PCWSTR(value.as_ptr()),
+            RRF_RT_REG_SZ,
+            None,
+            None,
+            Some(&mut bytes),
+        )
+    };
+    if status != WIN32_ERROR(0) || bytes < 2 {
+        return None;
+    }
+    let mut buffer = vec![0_u16; bytes as usize / 2];
+    let status = unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            PCWSTR(subkey.as_ptr()),
+            PCWSTR(value.as_ptr()),
+            RRF_RT_REG_SZ,
+            None,
+            Some(buffer.as_mut_ptr().cast()),
+            Some(&mut bytes),
+        )
+    };
+    if status != WIN32_ERROR(0) {
+        return None;
+    }
+    String::from_utf16(&buffer)
+        .ok()
+        .map(|name| name.trim_end_matches('\0').trim().to_owned())
+        .filter(|name| !name.is_empty())
+}
+
+fn clean(value: &Option<String>) -> Option<String> {
+    value
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
+fn wide(value: &str) -> Vec<u16> {
+    value.encode_utf16().chain(Some(0)).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_processor_instance;
+
+    #[test]
+    fn parses_processor_groups() {
+        assert_eq!(parse_processor_instance("0,11"), Some((0, 11)));
+        assert_eq!(parse_processor_instance("1,3"), Some((1, 3)));
+        assert_eq!(parse_processor_instance("_Total"), None);
     }
 }

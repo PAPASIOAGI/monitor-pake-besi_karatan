@@ -1,7 +1,7 @@
 use egui::{RichText, Ui};
 
 use crate::domain::SystemSnapshot;
-use crate::util::format;
+use crate::util::format::{self, percent};
 
 use super::theme;
 use super::widgets::{panel, section_heading, usage_bar};
@@ -50,7 +50,7 @@ pub fn show(ui: &mut Ui, snapshot: Option<&SystemSnapshot>) {
             panel(&mut columns[0], |ui| {
                 section_heading(ui, "Engine activity");
                 ui.label(
-                    RichText::new(format!("{:.1}%", gpu.total_utilization))
+                    RichText::new(percent(gpu.total_utilization))
                         .size(32.0)
                         .strong(),
                 );

@@ -1,250 +1,310 @@
-use std::ffi::OsStr;
-use std::os::windows::ffi::OsStrExt;
+use std::collections::{BTreeMap, BTreeSet};
+use std::mem::size_of;
 
-use windows::Win32::Foundation::{INVALID_HANDLE_VALUE, WIN32_ERROR};
+use serde::Deserialize;
+use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::Storage::FileSystem::{
-    GetLogicalDrives, GetDiskFreeSpaceExW,
+    CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE, GetLogicalDrives,
+    GetVolumeNameForVolumeMountPointW, IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS, OPEN_EXISTING,
 };
-use windows::Win32::Storage::FileSystem::GetVolumeNameForVolumeMountPointW;
+use windows::Win32::System::IO::DeviceIoControl;
+use windows::Win32::System::Ioctl::{
+    GET_LENGTH_INFORMATION, IOCTL_DISK_GET_LENGTH_INFO, IOCTL_STORAGE_QUERY_PROPERTY,
+    PropertyStandardQuery, STORAGE_DEVICE_DESCRIPTOR, STORAGE_PROPERTY_QUERY,
+    StorageDeviceProperty, VOLUME_DISK_EXTENTS,
+};
+use windows::core::PCWSTR;
 
-use crate::domain::storage::{PhysicalDisk, MediaType, BusType};
+use crate::domain::{BusType, MediaType, PhysicalDisk};
 use crate::error::CollectorError;
-use crate::platform::windows::pdh::{PdhQuery, PdhCounter};
+use crate::platform::windows::pdh::{PdhCounter, PdhQuery};
+
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct WmiDisk {
+    index: u32,
+    model: Option<String>,
+    size: Option<u64>,
+    interface_type: Option<String>,
+    #[serde(rename = "PNPDeviceID")]
+    pnp_device_id: Option<String>,
+}
+
+struct DiskIdentity {
+    model: String,
+    total_bytes: u64,
+    media_type: MediaType,
+    bus_type: BusType,
+}
+
+struct DeviceHandle(HANDLE);
+
+impl Drop for DeviceHandle {
+    fn drop(&mut self) {
+        // SAFETY: the handle is owned by this object and closed exactly once.
+        unsafe { CloseHandle(self.0).ok() };
+    }
+}
 
 pub struct DiskCollector {
     query: PdhQuery,
-    read_counters: Vec<PdhCounter>,
-    write_counters: Vec<PdhCounter>,
-    active_time_counters: Vec<PdhCounter>,
-    device_numbers: Vec<u32>,
+    activity: Option<PdhCounter>,
+    read: Option<PdhCounter>,
+    write: Option<PdhCounter>,
+    identities: BTreeMap<u32, DiskIdentity>,
 }
 
 impl DiskCollector {
     pub fn new() -> Result<Self, CollectorError> {
         let query = PdhQuery::new()?;
-        
-        let mut device_numbers = Vec::new();
-        let mut read_counters = Vec::new();
-        let mut write_counters = Vec::new();
-        let mut active_time_counters = Vec::new();
-
-        let drives = unsafe { GetLogicalDrives() };
-        for i in 0..26 {
-            if drives & (1 << i) != 0 {
-                let drive_letter = (b'A' + i) as char;
-                let volume_path = format!("{}:\\", drive_letter);
-                
-                if let Ok(device_number) = Self::get_device_number(&volume_path) {
-                    device_numbers.push(device_number);
-                    
-                    let read_path = format!(r"\PhysicalDisk({})\Disk Read Bytes/sec", device_number);
-                    let write_path = format!(r"\PhysicalDisk({})\Disk Write Bytes/sec", device_number);
-                    let active_path = format!(r"\PhysicalDisk({})\% Disk Time", device_number);
-                    
-                    if let Ok(c) = query.add_counter(&read_path) {
-                        read_counters.push(c);
-                    }
-                    if let Ok(c) = query.add_counter(&write_path) {
-                        write_counters.push(c);
-                    }
-                    if let Ok(c) = query.add_counter(&active_path) {
-                        active_time_counters.push(c);
-                    }
-                }
-            }
-        }
-
+        let identities = wmi::WMIConnection::new()
+            .and_then(|connection| connection.query::<WmiDisk>())
+            .map(|rows| {
+                rows.into_iter()
+                    .map(|row| {
+                        let bus_type =
+                            bus_type(row.interface_type.as_deref(), row.pnp_device_id.as_deref());
+                        (
+                            row.index,
+                            DiskIdentity {
+                                model: row.model.unwrap_or_else(|| "N/A".into()),
+                                total_bytes: row.size.unwrap_or(0),
+                                media_type: MediaType::Unknown,
+                                bus_type,
+                            },
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         Ok(Self {
+            activity: query.add_counter(r"\PhysicalDisk(*)\% Idle Time").ok(),
+            read: query
+                .add_counter(r"\PhysicalDisk(*)\Disk Read Bytes/sec")
+                .ok(),
+            write: query
+                .add_counter(r"\PhysicalDisk(*)\Disk Write Bytes/sec")
+                .ok(),
             query,
-            read_counters,
-            write_counters,
-            active_time_counters,
-            device_numbers,
+            identities,
         })
-    }
-
-    pub fn get_device_number(volume_path: &str) -> Result<u32, CollectorError> {
-        let volume_path_wide: Vec<u16> = OsStr::new(volume_path).encode_wide().chain(Some(0)).collect();
-        
-        let mut volume_name = [0u16; 260];
-        let result = unsafe {
-            GetVolumeNameForVolumeMountPointW(
-                windows::core::PCWSTR(volume_path_wide.as_ptr()),
-                &mut volume_name,
-            )
-        };
-        
-        if result == 0 {
-            return Err(CollectorError::Windows("GetVolumeNameForVolumeMountPointW failed".into()));
-        }
-        
-        let volume_handle = unsafe {
-            windows::Win32::System::IO::CreateFileW(
-                windows::core::PCWSTR(volume_name.as_ptr()),
-                windows::Win32::System::IO::GENERIC_READ,
-                windows::Win32::System::IO::FILE_SHARE_READ | windows::Win32::System::IO::FILE_SHARE_WRITE,
-                None,
-                windows::Win32::System::IO::OPEN_EXISTING,
-                windows::Win32::System::IO::FILE_ATTRIBUTE_NORMAL,
-                None,
-            )
-        };
-        
-        if volume_handle == INVALID_HANDLE_VALUE {
-            return Err(CollectorError::Windows("CreateFileW for volume failed".into()));
-        }
-        
-        let mut extents = windows::Win32::Storage::DeviceIOControl::VOLUME_DISK_EXTENTS {
-            NumberOfDiskExtents: 0,
-            Extents: [Default::default(); 1],
-        };
-        let mut bytes_returned = 0u32;
-        
-        let result = unsafe {
-            windows::Win32::System::IO::DeviceIoControl(
-                volume_handle,
-                windows::Win32::Storage::DeviceIOControl::IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS,
-                None,
-                0,
-                Some(&mut extents as *mut _ as *mut _),
-                std::mem::size_of::<windows::Win32::Storage::DeviceIOControl::VOLUME_DISK_EXTENTS>() as u32,
-                Some(&mut bytes_returned),
-                None,
-            )
-        };
-        
-        unsafe { windows::Win32::Foundation::CloseHandle(volume_handle) };
-        
-        if result == 0 || extents.NumberOfDiskExtents == 0 {
-            return Err(CollectorError::Windows("IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS failed".into()));
-        }
-        
-        Ok(extents.Extents[0].DiskNumber)
     }
 
     pub fn collect(&mut self) -> Result<Vec<PhysicalDisk>, CollectorError> {
         self.query.collect()?;
-
-        let mut disks = Vec::new();
-        
-        for (idx, &device_number) in self.device_numbers.iter().enumerate() {
-            let (model, media_type, bus_type, total_bytes) = Self::get_disk_info(device_number)?;
-            
-            let read_bytes = if idx < self.read_counters.len() {
-                self.read_counters[idx].get_double().ok().map(|v| v as u64)
-            } else { None };
-            
-            let write_bytes = if idx < self.write_counters.len() {
-                self.write_counters[idx].get_double().ok().map(|v| v as u64)
-            } else { None };
-            
-            let active_time = if idx < self.active_time_counters.len() {
-                self.active_time_counters[idx].get_double().ok().map(|v| v as f32)
-            } else { None };
-
-            disks.push(PhysicalDisk {
-                device_number,
-                model,
-                total_bytes,
-                media_type,
-                bus_type,
-                read_bytes_per_sec: read_bytes,
-                write_bytes_per_sec: write_bytes,
-                active_time_percent: active_time,
-            });
-        }
-
+        let activity = self
+            .activity
+            .as_ref()
+            .and_then(|counter| counter.get_instance_values().ok())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|(name, _)| name != "_Total")
+            .filter_map(|(name, value)| {
+                let number = name.split_whitespace().next()?.parse::<u32>().ok()?;
+                value
+                    .is_finite()
+                    .then_some((number, (100.0 - value).clamp(0.0, 100.0) as f32))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let read = numeric_instances(&self.read);
+        let write = numeric_instances(&self.write);
+        let active_devices = active_device_numbers();
+        let mut identities = std::mem::take(&mut self.identities);
+        let disks = identities
+            .iter_mut()
+            .map(|(&number, identity)| {
+                if active_devices.contains(&number)
+                    && let Ok(native) = native_disk_identity(number)
+                {
+                    identity.model = native.model;
+                    identity.total_bytes = native.total_bytes;
+                    identity.media_type = native.media_type;
+                    if native.bus_type != BusType::Unknown {
+                        identity.bus_type = native.bus_type;
+                    }
+                }
+                PhysicalDisk {
+                    device_number: number,
+                    model: identity.model.clone(),
+                    total_bytes: identity.total_bytes,
+                    media_type: identity.media_type,
+                    bus_type: identity.bus_type,
+                    read_bytes_per_sec: read.get(&number).copied(),
+                    write_bytes_per_sec: write.get(&number).copied(),
+                    active_time_percent: activity.get(&number).copied(),
+                }
+            })
+            .collect();
+        self.identities = identities;
         Ok(disks)
     }
+}
 
-    fn get_disk_info(device_number: u32) -> Result<(String, MediaType, BusType, u64), CollectorError> {
-        let device_path = format!(r"\\.\PhysicalDrive{}", device_number);
-        let device_path_wide: Vec<u16> = OsStr::new(&device_path).encode_wide().chain(Some(0)).collect();
-        
-        let handle = unsafe {
-            windows::Win32::System::IO::CreateFileW(
-                windows::core::PCWSTR(device_path_wide.as_ptr()),
-                windows::Win32::System::IO::GENERIC_READ,
-                windows::Win32::System::IO::FILE_SHARE_READ | windows::Win32::System::IO::FILE_SHARE_WRITE,
-                None,
-                windows::Win32::System::IO::OPEN_EXISTING,
-                windows::Win32::System::IO::FILE_ATTRIBUTE_NORMAL,
-                None,
-            )
-        };
-        
-        if handle == INVALID_HANDLE_VALUE {
-            return Ok(("Unknown".into(), MediaType::Unknown, BusType::Unknown, 0));
-        }
-        
-        let mut model = String::new();
-        let mut media_type = MediaType::Unknown;
-        let mut bus_type = BusType::Unknown;
-        let mut total_bytes = 0u64;
-
-        let mut query = windows::Win32::Storage::DeviceIOControl::STORAGE_PROPERTY_QUERY {
-            PropertyId: windows::Win32::Storage::DeviceIOControl::STORAGE_PROPERTY_ID::StorageDeviceProperty,
-            QueryType: windows::Win32::Storage::DeviceIOControl::STORAGE_QUERY_TYPE::PropertyStandardQuery,
-            AdditionalParameters: [0; 1],
-        };
-        
-        let mut buffer = [0u8; 1024];
-        let mut bytes_returned = 0u32;
-        
-        let result = unsafe {
-            windows::Win32::System::IO::DeviceIoControl(
-                handle,
-                windows::Win32::Storage::DeviceIOControl::IOCTL_STORAGE_QUERY_PROPERTY,
-                Some(&query as *const _ as *const _),
-                std::mem::size_of::<windows::Win32::Storage::DeviceIOControl::STORAGE_PROPERTY_QUERY>() as u32,
-                Some(buffer.as_mut_ptr() as *mut _),
-                buffer.len() as u32,
-                Some(&mut bytes_returned),
-                None,
-            )
-        };
-        
-        if result != 0 && bytes_returned > 0 {
-            let descriptor = unsafe { &*(buffer.as_ptr() as *const windows::Win32::Storage::DeviceIOControl::STORAGE_DEVICE_DESCRIPTOR) };
-            
-            if descriptor.ProductIdOffset > 0 {
-                let offset = descriptor.ProductIdOffset as usize;
-                let end = buffer[offset..].iter().position(|&b| b == 0).unwrap_or(buffer.len() - offset);
-                model = String::from_utf8_lossy(&buffer[offset..offset + end]).trim().to_string();
-            }
-            
-            media_type = match descriptor.DeviceType {
-                0x07 => MediaType::Ssd,
-                0x00 => MediaType::Hdd,
-                _ => MediaType::Unknown,
-            };
-            
-            bus_type = match descriptor.BusType {
-                17 => BusType::Nvme,
-                11 => BusType::Sata,
-                7 => BusType::Usb,
-                _ => BusType::Unknown,
-            };
-        }
-
-        let mut total_bytes64 = 0u64;
-        let mut free_bytes = 0u64;
-        let mut total_free = 0u64;
-        let device_path_wide: Vec<u16> = OsStr::new(&device_path).encode_wide().chain(Some(0)).collect();
-        
-        let _ = unsafe {
-            GetDiskFreeSpaceExW(
-                windows::core::PCWSTR(device_path_wide.as_ptr()),
-                Some(&mut free_bytes),
-                Some(&mut total_bytes64),
-                Some(&mut total_free),
-            )
-        };
-        
-        total_bytes = total_bytes64;
-        
-        unsafe { windows::Win32::Foundation::CloseHandle(handle) };
-
-        Ok((model, media_type, bus_type, total_bytes))
+pub fn get_device_number(volume_path: &str) -> Result<u32, CollectorError> {
+    let path = wide(volume_path);
+    let mut volume_name = [0_u16; 260];
+    unsafe { GetVolumeNameForVolumeMountPointW(PCWSTR(path.as_ptr()), &mut volume_name) }
+        .map_err(|error| CollectorError::Windows(format!("volume name: {error}")))?;
+    let mut device_name = volume_name.to_vec();
+    if let Some(position) = device_name.iter().position(|character| *character == 0) {
+        device_name.truncate(position);
     }
+    if device_name.ends_with(&['\\' as u16]) {
+        device_name.pop();
+    }
+    device_name.push(0);
+    // A volume handle with zero access only queries metadata and does not require raw disk access.
+    let handle = unsafe {
+        CreateFileW(
+            PCWSTR(device_name.as_ptr()),
+            0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            None,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            None,
+        )
+    }
+    .map_err(|error| CollectorError::Windows(format!("volume open: {error}")))?;
+    let handle = DeviceHandle(handle);
+    let mut bytes = 0;
+    let mut buffer = [0_u8; 512];
+    unsafe {
+        DeviceIoControl(
+            handle.0,
+            IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS,
+            None,
+            0,
+            Some(buffer.as_mut_ptr().cast()),
+            buffer.len() as u32,
+            Some(&mut bytes),
+            None,
+        )
+    }
+    .map_err(|error| CollectorError::Windows(format!("volume disk extents: {error}")))?;
+    // SAFETY: the IOCTL returned a VOLUME_DISK_EXTENTS structure in this buffer.
+    let extents = unsafe { &*buffer.as_ptr().cast::<VOLUME_DISK_EXTENTS>() };
+    if extents.NumberOfDiskExtents == 0 {
+        return Err(CollectorError::Unavailable(
+            "volume has no disk extent".into(),
+        ));
+    }
+    // SAFETY: Extents is a flexible array, and at least one extent was returned.
+    let extent = unsafe { &*extents.Extents.as_ptr() };
+    Ok(extent.DiskNumber)
+}
+
+fn numeric_instances(counter: &Option<PdhCounter>) -> BTreeMap<u32, u64> {
+    counter
+        .as_ref()
+        .and_then(|counter| counter.get_instance_values().ok())
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|(name, _)| name != "_Total")
+        .filter_map(|(name, value)| {
+            let number = name.split_whitespace().next()?.parse::<u32>().ok()?;
+            (value.is_finite() && value >= 0.0).then_some((number, value as u64))
+        })
+        .collect()
+}
+
+fn active_device_numbers() -> BTreeSet<u32> {
+    let drives = unsafe { GetLogicalDrives() };
+    (0..26)
+        .filter(|index| drives & (1 << index) != 0)
+        .filter_map(|index| get_device_number(&format!("{}:\\", (b'A' + index) as char)).ok())
+        .collect()
+}
+
+fn native_disk_identity(number: u32) -> Result<DiskIdentity, CollectorError> {
+    let path = wide(&format!(r"\\.\PhysicalDrive{number}"));
+    let handle = unsafe {
+        CreateFileW(
+            PCWSTR(path.as_ptr()),
+            0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            None,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            None,
+        )
+    }
+    .map_err(|error| CollectorError::Windows(format!("disk {number} open: {error}")))?;
+    let handle = DeviceHandle(handle);
+    let query = STORAGE_PROPERTY_QUERY {
+        PropertyId: StorageDeviceProperty,
+        QueryType: PropertyStandardQuery,
+        AdditionalParameters: [0; 1],
+    };
+    let mut bytes = 0;
+    let mut buffer = [0_u8; 1024];
+    unsafe {
+        DeviceIoControl(
+            handle.0,
+            IOCTL_STORAGE_QUERY_PROPERTY,
+            Some((&query as *const STORAGE_PROPERTY_QUERY).cast()),
+            size_of::<STORAGE_PROPERTY_QUERY>() as u32,
+            Some(buffer.as_mut_ptr().cast()),
+            buffer.len() as u32,
+            Some(&mut bytes),
+            None,
+        )
+    }
+    .map_err(|error| CollectorError::Windows(format!("disk {number} properties: {error}")))?;
+    // SAFETY: the IOCTL returned a STORAGE_DEVICE_DESCRIPTOR with variable trailing strings.
+    let descriptor = unsafe { &*buffer.as_ptr().cast::<STORAGE_DEVICE_DESCRIPTOR>() };
+    let model =
+        descriptor_string(&buffer, descriptor.ProductIdOffset).unwrap_or_else(|| "N/A".into());
+    let mut length = GET_LENGTH_INFORMATION::default();
+    let total_bytes = unsafe {
+        DeviceIoControl(
+            handle.0,
+            IOCTL_DISK_GET_LENGTH_INFO,
+            None,
+            0,
+            Some((&mut length as *mut GET_LENGTH_INFORMATION).cast()),
+            size_of::<GET_LENGTH_INFORMATION>() as u32,
+            Some(&mut bytes),
+            None,
+        )
+    }
+    .map(|_| length.Length as u64)
+    .unwrap_or(0);
+    Ok(DiskIdentity {
+        model,
+        total_bytes,
+        media_type: MediaType::Unknown,
+        bus_type: match descriptor.BusType.0 {
+            17 => BusType::Nvme,
+            11 => BusType::Sata,
+            7 => BusType::Usb,
+            _ => BusType::Unknown,
+        },
+    })
+}
+
+fn descriptor_string(buffer: &[u8], offset: u32) -> Option<String> {
+    let tail = buffer.get(offset as usize..)?;
+    let length = tail
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(tail.len());
+    let text = String::from_utf8_lossy(&tail[..length]).trim().to_owned();
+    (!text.is_empty()).then_some(text)
+}
+
+fn bus_type(interface: Option<&str>, pnp: Option<&str>) -> BusType {
+    if pnp.is_some_and(|id| id.contains("VEN_NVME")) {
+        BusType::Nvme
+    } else if pnp.is_some_and(|id| id.starts_with("USBSTOR")) {
+        BusType::Usb
+    } else if interface.is_some_and(|kind| kind == "SCSI") {
+        BusType::Unknown
+    } else {
+        BusType::Sata
+    }
+}
+
+fn wide(value: &str) -> Vec<u16> {
+    value.encode_utf16().chain(Some(0)).collect()
 }

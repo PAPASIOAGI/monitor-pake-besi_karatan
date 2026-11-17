@@ -46,15 +46,15 @@ impl MonitorApp {
 impl eframe::App for MonitorApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if let Some(snapshot) = self.service.latest_snapshot() {
-            self.history.cpu.push(snapshot.cpu.total_utilization);
+            if let Some(cpu_usage) = snapshot.cpu.total_utilization {
+                self.history.cpu.push(cpu_usage);
+            }
             self.history.ram.push(snapshot.memory.usage_percent());
-            self.history.gpu.push(
-                snapshot
-                    .gpus
-                    .first()
-                    .map(|g| g.total_utilization)
-                    .unwrap_or(0.0),
-            );
+            if let Some(gpu) = snapshot.gpus.first()
+                && let Some(gpu_usage) = gpu.total_utilization
+            {
+                self.history.gpu.push(gpu_usage);
+            }
             self.latest = Some(snapshot);
         }
 

@@ -2,7 +2,7 @@ use egui::{RichText, Ui};
 
 use crate::domain::SystemSnapshot;
 use crate::monitoring::HistoryBuffer;
-use crate::util::format;
+use crate::util::format::{self, percent};
 
 use super::theme;
 use super::widgets::{metric_summary, panel, section_heading, time_series_chart, usage_bar};
@@ -29,12 +29,12 @@ pub fn show(
             metric_summary(
                 ui,
                 "CPU",
-                &format!("{:.1}%", snap.cpu.total_utilization),
+                &percent(snap.cpu.total_utilization),
                 &format!(
                     "{} cores · {} active",
                     snap.cpu.physical_cores, snap.cpu.active_cores
                 ),
-                snap.cpu.total_utilization / 100.0,
+                snap.cpu.total_utilization.unwrap_or(0.0) / 100.0,
             );
         });
         ui.allocate_ui(egui::vec2(width, 100.0), |ui| {
@@ -55,9 +55,9 @@ pub fn show(
                 metric_summary(
                     ui,
                     "GPU",
-                    &format!("{:.1}%", gpu.total_utilization),
+                    &percent(gpu.total_utilization),
                     &gpu.name,
-                    gpu.total_utilization / 100.0,
+                    gpu.total_utilization.unwrap_or(0.0) / 100.0,
                 );
             });
         }
@@ -103,8 +103,12 @@ pub fn show(
                             .color(theme::SECONDARY),
                     );
                     ui.add_space(8.0);
-                    usage_bar(ui, logical.utilization / 100.0, theme::ACCENT);
-                    ui.label(RichText::new(format!("{:5.1}%", logical.utilization)).monospace());
+                    usage_bar(
+                        ui,
+                        logical.utilization.unwrap_or(0.0) / 100.0,
+                        theme::ACCENT,
+                    );
+                    ui.label(RichText::new(percent(logical.utilization)).monospace());
                 });
             }
         });

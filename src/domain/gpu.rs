@@ -1,8 +1,13 @@
 #[derive(Debug, Clone, Default)]
+#[allow(dead_code)] // Fields populated by Windows GPU collector; UI reads subset for MVP
 pub struct GpuSnapshot {
     pub name: String,
     pub vendor: String,
-    pub total_utilization: f32,
+    pub vendor_id: u32,
+    pub device_id: u32,
+    pub board_vendor: Option<String>,
+    pub memory_vendor: Option<String>,
+    pub total_utilization: Option<f32>,
     pub engines: Vec<GpuEngine>,
     pub dedicated_vram_total_bytes: Option<u64>,
     pub dedicated_vram_used_bytes: Option<u64>,
@@ -21,9 +26,7 @@ pub struct GpuEngine {
     pub utilization: f32,
 }
 
-/// All variants will be constructed once the PDH GPU collector lands.
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum GpuEngineKind {
     ThreeD,
     Compute,

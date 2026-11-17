@@ -18,6 +18,12 @@ pub fn format_bytes(bytes: u64) -> String {
     }
 }
 
+pub fn percent(value: Option<f32>) -> String {
+    value
+        .map(|value| format!("{value:.1}%"))
+        .unwrap_or_else(|| "N/A".into())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

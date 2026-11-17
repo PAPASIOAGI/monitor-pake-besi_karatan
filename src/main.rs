@@ -3,6 +3,7 @@ mod config;
 mod domain;
 mod error;
 mod monitoring;
+mod platform;
 mod ui;
 mod util;
 

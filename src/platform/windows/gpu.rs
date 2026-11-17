@@ -1,268 +1,240 @@
-use std::ffi::OsStr;
-use std::os::windows::ffi::OsStrExt;
-use std::ptr;
+use std::collections::BTreeMap;
 
 use windows::Win32::Graphics::Dxgi::{
-    CreateDXGIFactory1, IDXGIFactory1, IDXGIAdapter1, DXGI_ADAPTER_DESC1,
-    DXGI_ADAPTER_FLAG_SOFTWARE,
-};
-use windows::Win32::System::Performance::{
-    PdhAddEnglishCounterW, PdhCollectQueryData, PdhGetFormattedCounterArrayW, PdhOpenQueryW,
-    PdhCloseQuery, PDH_FMT_COUNTERVALUE_ITEM_W, PDH_FMT_DOUBLE,
-    PDH_HQUERY, PDH_HCOUNTER,
+    CreateDXGIFactory1, DXGI_ADAPTER_DESC1, DXGI_ADAPTER_FLAG_SOFTWARE, IDXGIFactory1,
 };
 
-use crate::domain::gpu::{GpuSnapshot, GpuEngine, GpuEngineKind};
+use crate::domain::{GpuEngine, GpuEngineKind, GpuSnapshot};
 use crate::error::CollectorError;
-use crate::platform::windows::pdh::{PdhQuery, PdhCounter};
+use crate::platform::windows::pdh::{PdhCounter, PdhQuery};
+
+struct Adapter {
+    name: String,
+    vendor: String,
+    vendor_id: u32,
+    device_id: u32,
+    luid: i64,
+    dedicated_total: u64,
+    shared_total: u64,
+}
 
 pub struct GpuCollector {
     query: PdhQuery,
-    adapters: Vec<GpuAdapterInfo>,
-    engine_counters: Vec<PdhCounter>,
-    dedicated_counters: Vec<PdhCounter>,
-    shared_counters: Vec<PdhCounter>,
-    initialized: bool,
-}
-
-struct GpuAdapterInfo {
-    name: String,
-    vendor: String,
-    luid: i64,
-    dedicated_memory: u64,
-    shared_memory: u64,
+    adapters: Vec<Adapter>,
+    engines: Option<PdhCounter>,
+    dedicated: Option<PdhCounter>,
+    shared: Option<PdhCounter>,
 }
 
 impl GpuCollector {
     pub fn new() -> Result<Self, CollectorError> {
-        let adapters = Self::enumerate_adapters()?;
-        
+        let adapters = enumerate_adapters()?;
         let query = PdhQuery::new()?;
-        
-        let mut engine_counters = Vec::new();
-        let mut dedicated_counters = Vec::new();
-        let mut shared_counters = Vec::new();
-        
-        for idx in 0..adapters.len() {
-            let engine_path = format!(r"\GPU Engine({})\Utilization Percentage", idx);
-            if let Ok(c) = query.add_counter(&engine_path) {
-                engine_counters.push(c);
-            }
-            
-            let dedicated_path = format!(r"\GPU Adapter Memory({})\Dedicated Usage", idx);
-            if let Ok(c) = query.add_counter(&dedicated_path) {
-                dedicated_counters.push(c);
-            }
-            
-            let shared_path = format!(r"\GPU Adapter Memory({})\Shared Usage", idx);
-            if let Ok(c) = query.add_counter(&shared_path) {
-                shared_counters.push(c);
-            }
-        }
-        
         Ok(Self {
+            engines: query
+                .add_counter(r"\GPU Engine(*)\Utilization Percentage")
+                .ok(),
+            dedicated: query
+                .add_counter(r"\GPU Adapter Memory(*)\Dedicated Usage")
+                .ok(),
+            shared: query
+                .add_counter(r"\GPU Adapter Memory(*)\Shared Usage")
+                .ok(),
             query,
             adapters,
-            engine_counters,
-            dedicated_counters,
-            shared_counters,
-            initialized: false,
         })
-    }
-
-    fn enumerate_adapters() -> Result<Vec<GpuAdapterInfo>, CollectorError> {
-        let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1().map_err(|e| CollectorError::Windows(format!("CreateDXGIFactory1 failed: {}", e)))? };
-        
-        let mut adapters = Vec::new();
-        let mut index = 0u32;
-        
-        loop {
-            let adapter_result: Result<IDXGIAdapter1, _> = unsafe { factory.EnumAdapters1(index) };
-            if adapter_result.is_err() {
-                break;
-            }
-            
-            let adapter = adapter_result.unwrap();
-            let desc: DXGI_ADAPTER_DESC1 = unsafe { adapter.GetDesc1().map_err(|e| CollectorError::Windows(format!("GetDesc1 failed: {}", e)))? };
-            
-            if (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32) != 0 {
-                index += 1;
-                continue;
-            }
-            
-            let name = String::from_utf16_lossy(&desc.Description).trim_end_matches('\0').to_string();
-            let vendor = Self::get_vendor_name(desc.VendorId);
-            let luid = ((desc.AdapterLuid.HighPart as i64) << 32) | (desc.AdapterLuid.LowPart as u32 as i64);
-            let dedicated_memory = desc.DedicatedVideoMemory;
-            let shared_memory = desc.SharedSystemMemory;
-            
-            adapters.push(GpuAdapterInfo {
-                name,
-                vendor,
-                luid,
-                dedicated_memory,
-                shared_memory,
-            });
-            
-            index += 1;
-        }
-        
-        if adapters.is_empty() {
-            return Err(CollectorError::Unavailable("No GPU adapters found".into()));
-        }
-        
-        Ok(adapters)
-    }
-
-    fn get_vendor_name(vendor_id: u32) -> String {
-        match vendor_id {
-            0x10DE => "NVIDIA".into(),
-            0x1002 => "AMD".into(),
-            0x8086 => "Intel".into(),
-            0x13B5 => "ARM".into(),
-            0x1010 => "ImgTec".into(),
-            _ => format!("Unknown (0x{:04X})", vendor_id),
-        }
     }
 
     pub fn collect(&mut self) -> Result<Vec<GpuSnapshot>, CollectorError> {
         self.query.collect()?;
-        
-        let mut gpus = Vec::new();
-        
-        for (idx, adapter) in self.adapters.iter().enumerate() {
-            let total_util = if idx < self.engine_counters.len() {
-                self.engine_counters[idx].get_double().unwrap_or(0.0).clamp(0.0, 100.0) as f32
-            } else { 0.0 };
-            
-            let engines = Self::parse_engine_instances(idx)?;
-            
-            let dedicated_used = if idx < self.dedicated_counters.len() {
-                self.dedicated_counters[idx].get_double().ok().map(|v| v as u64)
-            } else { None };
-            
-            let shared_used = if idx < self.shared_counters.len() {
-                self.shared_counters[idx].get_double().ok().map(|v| v as u64)
-            } else { None };
-            
-            let dedicated_total = if adapter.dedicated_memory > 0 {
-                Some(adapter.dedicated_memory)
-            } else { None };
-            
-            let shared_total = if adapter.shared_memory > 0 {
-                Some(adapter.shared_memory)
-            } else { None };
-            
-            gpus.push(GpuSnapshot {
-                name: adapter.name.clone(),
-                vendor: adapter.vendor.clone(),
-                total_utilization: total_util,
-                engines,
-                dedicated_vram_total_bytes: dedicated_total,
-                dedicated_vram_used_bytes: dedicated_used,
-                shared_memory_total_bytes: shared_total,
-                shared_memory_used_bytes: shared_used,
-                temperature_celsius: None,
-                core_clock_mhz: None,
-                memory_clock_mhz: None,
-                power_watts: None,
-                fan_rpm: None,
-            });
+        let engine_values = self
+            .engines
+            .as_ref()
+            .and_then(|counter| counter.get_instance_values().ok())
+            .unwrap_or_default();
+        let dedicated_values = self
+            .dedicated
+            .as_ref()
+            .and_then(|counter| counter.get_instance_values().ok())
+            .unwrap_or_default();
+        let shared_values = self
+            .shared
+            .as_ref()
+            .and_then(|counter| counter.get_instance_values().ok())
+            .unwrap_or_default();
+
+        Ok(self
+            .adapters
+            .iter()
+            .map(|adapter| {
+                let (engines, total) = aggregate_engines(&engine_values, adapter.luid);
+                GpuSnapshot {
+                    name: adapter.name.clone(),
+                    vendor: adapter.vendor.clone(),
+                    vendor_id: adapter.vendor_id,
+                    device_id: adapter.device_id,
+                    board_vendor: None,
+                    memory_vendor: None,
+                    total_utilization: total,
+                    engines,
+                    dedicated_vram_total_bytes: Some(adapter.dedicated_total),
+                    dedicated_vram_used_bytes: memory_usage(&dedicated_values, adapter.luid),
+                    shared_memory_total_bytes: Some(adapter.shared_total),
+                    shared_memory_used_bytes: memory_usage(&shared_values, adapter.luid),
+                    temperature_celsius: None,
+                    core_clock_mhz: None,
+                    memory_clock_mhz: None,
+                    power_watts: None,
+                    fan_rpm: None,
+                }
+            })
+            .collect())
+    }
+}
+
+fn enumerate_adapters() -> Result<Vec<Adapter>, CollectorError> {
+    let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1() }
+        .map_err(|error| CollectorError::Windows(format!("CreateDXGIFactory1: {error}")))?;
+    let mut adapters = Vec::new();
+    for index in 0.. {
+        let Ok(adapter) = (unsafe { factory.EnumAdapters1(index) }) else {
+            break;
+        };
+        let desc: DXGI_ADAPTER_DESC1 = unsafe { adapter.GetDesc1() }
+            .map_err(|error| CollectorError::Windows(format!("DXGI GetDesc1: {error}")))?;
+        if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0 {
+            continue;
         }
-        
-        self.initialized = true;
-        Ok(gpus)
+        let description = desc
+            .Description
+            .split(|character| *character == 0)
+            .next()
+            .unwrap_or_default();
+        adapters.push(Adapter {
+            name: String::from_utf16_lossy(description),
+            vendor: vendor_name(desc.VendorId).into(),
+            vendor_id: desc.VendorId,
+            device_id: desc.DeviceId,
+            luid: ((desc.AdapterLuid.HighPart as i64) << 32) | desc.AdapterLuid.LowPart as i64,
+            dedicated_total: desc.DedicatedVideoMemory as u64,
+            shared_total: desc.SharedSystemMemory as u64,
+        });
+    }
+    Ok(adapters)
+}
+
+fn vendor_name(vendor_id: u32) -> &'static str {
+    match vendor_id {
+        0x10DE => "NVIDIA",
+        0x1002 => "AMD",
+        0x8086 => "Intel",
+        0x13B5 => "ARM",
+        _ => "Unknown",
+    }
+}
+
+fn instance_luid(instance: &str) -> Option<i64> {
+    let start = instance.find("luid_")? + 5;
+    let rest = &instance[start..];
+    // Format: high_low_...
+    let parts: Vec<&str> = rest.split('_').collect();
+    if parts.len() < 2 {
+        return None;
+    }
+    let high = i64::from_str_radix(parts[0].strip_prefix("0x")?, 16).ok()?;
+    let low = i64::from_str_radix(parts[1].strip_prefix("0x")?, 16).ok()?;
+    Some((high << 32) | low)
+}
+
+fn aggregate_engines(values: &[(String, f64)], luid: i64) -> (Vec<GpuEngine>, Option<f32>) {
+    let mut totals = BTreeMap::<GpuEngineKind, f64>::new();
+    for (instance, value) in values {
+        if instance_luid(instance) != Some(luid) || !value.is_finite() {
+            continue;
+        }
+        let kind = engine_kind(instance);
+        *totals.entry(kind).or_default() += value.clamp(0.0, 100.0);
+    }
+    let total = if totals.is_empty() {
+        None
+    } else {
+        Some(
+            totals
+                .values()
+                .fold(0.0_f64, |maximum, value| maximum.max(*value))
+                .clamp(0.0, 100.0) as f32,
+        )
+    };
+    let engines = totals
+        .into_iter()
+        .map(|(kind, value)| GpuEngine {
+            kind,
+            utilization: value.clamp(0.0, 100.0) as f32,
+        })
+        .collect();
+    (engines, total)
+}
+
+fn engine_kind(instance: &str) -> GpuEngineKind {
+    let marker = "engtype_";
+    let kind = instance
+        .split(marker)
+        .nth(1)
+        .unwrap_or_default()
+        .split('_')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    match kind.as_str() {
+        "3d" | "graphics" => GpuEngineKind::ThreeD,
+        "compute" => GpuEngineKind::Compute,
+        "copy" => GpuEngineKind::Copy,
+        "videodecode" => GpuEngineKind::VideoDecode,
+        "videoencode" => GpuEngineKind::VideoEncode,
+        "videoprocessing" => GpuEngineKind::VideoProcessing,
+        _ => GpuEngineKind::Other,
+    }
+}
+
+fn memory_usage(values: &[(String, f64)], luid: i64) -> Option<u64> {
+    let matching = values
+        .iter()
+        .filter(|(instance, value)| instance_luid(instance) == Some(luid) && value.is_finite())
+        .map(|(_, value)| value.max(0.0) as u64)
+        .collect::<Vec<_>>();
+    (!matching.is_empty()).then(|| matching.into_iter().sum())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{aggregate_engines, instance_luid};
+    use crate::domain::GpuEngineKind;
+
+    #[test]
+    fn parses_signed_luid() {
+        let instance = "pid_1_luid_0x00000000_0x0001c803_phys_0_eng_0_engtype_3D";
+        assert_eq!(instance_luid(instance), Some(0x1c803));
     }
 
-    fn parse_engine_instances(adapter_idx: usize) -> Result<Vec<GpuEngine>, CollectorError> {
-        let mut engines = Vec::new();
-        
-        let counter_path = format!(r"\GPU Engine({})\Utilization Percentage", adapter_idx);
-        let counter_path_wide: Vec<u16> = OsStr::new(&counter_path).encode_wide().chain(Some(0)).collect();
-        
-        let mut buffer_size = 0u32;
-        let mut item_count = 0u32;
-        let status = unsafe {
-            windows::Win32::System::Performance::PdhGetFormattedCounterArrayW(
-                ptr::null_mut(),
-                PDH_FMT_DOUBLE,
-                &mut buffer_size,
-                &mut item_count,
-                ptr::null_mut(),
-            )
-        };
-        
-        if status != 0 && status != 0x800007D2 {
-            return Err(CollectorError::Pdh(format!("PdhGetFormattedCounterArrayW size query failed: 0x{:X}", status)));
-        }
-        
-        if buffer_size == 0 {
-            return Ok(engines);
-        }
-        
-        let mut buffer = vec![0u8; buffer_size as usize];
-        let status = unsafe {
-            windows::Win32::System::Performance::PdhGetFormattedCounterArrayW(
-                ptr::null_mut(),
-                PDH_FMT_DOUBLE,
-                &mut buffer_size,
-                &mut item_count,
-                buffer.as_mut_ptr() as *mut _,
-            )
-        };
-        
-        if status != 0 {
-            return Err(CollectorError::Pdh(format!("PdhGetFormattedCounterArrayW failed: 0x{:X}", status)));
-        }
-        
-        let items = unsafe { std::slice::from_raw_parts(buffer.as_ptr() as *const windows::Win32::System::Performance::PDH_FMT_COUNTERVALUE_ITEM_W, item_count as usize) };
-        
-        for item in items {
-            let name_ptr = item.szName;
-            if name_ptr.is_null() {
-                continue;
-            }
-            
-            let name_len = (0..).take_while(|&i| unsafe { *name_ptr.0.add(i) != 0 }).count();
-            let name_slice = unsafe { std::slice::from_raw_parts(name_ptr.0, name_len) };
-            let instance_name = String::from_utf16_lossy(name_slice);
-            
-            if let Some(engine_kind) = Self::parse_engine_type(&instance_name) {
-                let util = unsafe { item.FmtValue.Anonymous.doubleValue }.clamp(0.0, 100.0) as f32;
-                engines.push(GpuEngine {
-                    kind: engine_kind,
-                    utilization: util,
-                });
-            }
-        }
-        
-        if engines.is_empty() {
-            engines.push(GpuEngine {
-                kind: GpuEngineKind::ThreeD,
-                utilization: 0.0,
-            });
-        }
-        
-        Ok(engines)
-    }
-
-    fn parse_engine_type(instance_name: &str) -> Option<GpuEngineKind> {
-        let name = instance_name.to_lowercase();
-        
-        if name.contains("3d") || name.contains("graphics") {
-            Some(GpuEngineKind::ThreeD)
-        } else if name.contains("compute") {
-            Some(GpuEngineKind::Compute)
-        } else if name.contains("copy") {
-            Some(GpuEngineKind::Copy)
-        } else if name.contains("video") && name.contains("decode") {
-            Some(GpuEngineKind::VideoDecode)
-        } else if name.contains("video") && name.contains("encode") {
-            Some(GpuEngineKind::VideoEncode)
-        } else if name.contains("video") && name.contains("process") {
-            Some(GpuEngineKind::VideoProcessing)
-        } else {
-            Some(GpuEngineKind::Other)
-        }
+    #[test]
+    fn filters_gpu_and_uses_busiest_engine() {
+        let values = vec![
+            (
+                "pid_1_luid_0x00000000_0x0001c803_eng_0_engtype_3D".into(),
+                42.0,
+            ),
+            (
+                "pid_2_luid_0x00000000_0x0001c803_eng_1_engtype_Copy".into(),
+                12.0,
+            ),
+            (
+                "pid_1_luid_0x00000001_0x0001c803_eng_0_engtype_3D".into(),
+                90.0,
+            ),
+        ];
+        let (engines, total) = aggregate_engines(&values, 0x1c803);
+        assert_eq!(total, Some(42.0));
+        assert_eq!(engines.len(), 2);
+        assert_eq!(engines[0].kind, GpuEngineKind::ThreeD);
     }
 }

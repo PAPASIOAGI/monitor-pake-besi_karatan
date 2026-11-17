@@ -2,15 +2,15 @@ use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
 
 use windows::Win32::Storage::FileSystem::{
-    GetLogicalDrives, GetDiskFreeSpaceExW, GetVolumeInformationW,
-    GetDriveTypeW,
+    GetDiskFreeSpaceExW, GetDriveTypeW, GetLogicalDrives, GetVolumeInformationW,
 };
 
 use crate::domain::storage::{Volume, VolumeKind};
 use crate::error::CollectorError;
-use crate::platform::windows::disk::DiskCollector;
+use crate::platform::windows::disk::get_device_number;
 
 pub struct VolumeCollector {
+    #[allow(dead_code)] // Built at startup; not currently used in collection path
     device_map: Vec<(String, u32)>,
 }
 
@@ -23,38 +23,41 @@ impl VolumeCollector {
     fn build_device_map() -> Result<Vec<(String, u32)>, CollectorError> {
         let mut device_map = Vec::new();
         let drives = unsafe { GetLogicalDrives() };
-        
+
         for i in 0..26 {
             if drives & (1 << i) != 0 {
                 let drive_letter = (b'A' + i) as char;
                 let volume_path = format!("{}:\\", drive_letter);
-                
-                if let Ok(device_number) = DiskCollector::get_device_number(&volume_path) {
+
+                if let Ok(device_number) = get_device_number(&volume_path) {
                     device_map.push((volume_path, device_number));
                 }
             }
         }
-        
+
         Ok(device_map)
     }
 
-    pub fn collect(&self) -> Result<Vec<Volume>, CollectorError> {
+    pub fn collect(&mut self) -> Result<Vec<Volume>, CollectorError> {
         let mut volumes = Vec::new();
         let drives = unsafe { GetLogicalDrives() };
-        
+
         for i in 0..26 {
             if drives & (1 << i) != 0 {
                 let drive_letter = (b'A' + i) as char;
                 let volume_path = format!("{}:\\", drive_letter);
-                
-                let volume_path_wide: Vec<u16> = OsStr::new(&volume_path).encode_wide().chain(Some(0)).collect();
-                
+
+                let volume_path_wide: Vec<u16> = OsStr::new(&volume_path)
+                    .encode_wide()
+                    .chain(Some(0))
+                    .collect();
+
                 let mut volume_name = [0u16; 260];
                 let mut fs_name = [0u16; 260];
                 let mut serial = 0u32;
                 let mut max_comp = 0u32;
                 let mut fs_flags = 0u32;
-                
+
                 let _result = unsafe {
                     GetVolumeInformationW(
                         windows::core::PCWSTR(volume_path_wide.as_ptr()),
@@ -65,14 +68,18 @@ impl VolumeCollector {
                         Some(&mut fs_name),
                     )
                 };
-                
-                let label = String::from_utf16_lossy(&volume_name).trim_end_matches('\0').to_string();
-                let filesystem = String::from_utf16_lossy(&fs_name).trim_end_matches('\0').to_string();
-                
+
+                let label = String::from_utf16_lossy(&volume_name)
+                    .trim_end_matches('\0')
+                    .to_string();
+                let filesystem = String::from_utf16_lossy(&fs_name)
+                    .trim_end_matches('\0')
+                    .to_string();
+
                 let mut free_bytes = 0u64;
                 let mut total_bytes = 0u64;
                 let mut total_free = 0u64;
-                
+
                 let _ = unsafe {
                     GetDiskFreeSpaceExW(
                         windows::core::PCWSTR(volume_path_wide.as_ptr()),
@@ -81,18 +88,19 @@ impl VolumeCollector {
                         Some(&mut total_free),
                     )
                 };
-                
+
                 let used_bytes = total_bytes.saturating_sub(free_bytes);
-                
-                let drive_type = unsafe { GetDriveTypeW(windows::core::PCWSTR(volume_path_wide.as_ptr())) };
+
+                let drive_type =
+                    unsafe { GetDriveTypeW(windows::core::PCWSTR(volume_path_wide.as_ptr())) };
                 let kind = match drive_type {
-                    3 => VolumeKind::Local,        // DRIVE_FIXED
-                    2 => VolumeKind::Removable,    // DRIVE_REMOVABLE
-                    4 => VolumeKind::Network,      // DRIVE_REMOTE
-                    5 => VolumeKind::Removable,    // DRIVE_CDROM
+                    3 => VolumeKind::Local,     // DRIVE_FIXED
+                    2 => VolumeKind::Removable, // DRIVE_REMOVABLE
+                    4 => VolumeKind::Network,   // DRIVE_REMOTE
+                    5 => VolumeKind::Removable, // DRIVE_CDROM
                     _ => VolumeKind::Unknown,
                 };
-                
+
                 volumes.push(Volume {
                     mount_point: volume_path,
                     label,
@@ -104,12 +112,14 @@ impl VolumeCollector {
                 });
             }
         }
-        
+
         Ok(volumes)
     }
 
+    #[allow(dead_code)] // Reserved for future volume-to-disk correlation
     pub fn get_device_number(&self, mount_point: &str) -> Option<u32> {
-        self.device_map.iter()
+        self.device_map
+            .iter()
             .find(|(mp, _)| mp == mount_point)
             .map(|(_, dn)| *dn)
     }

@@ -63,11 +63,11 @@ pub fn show(ui: &mut Ui, snapshot: Option<&SystemSnapshot>) {
                 detail_row(
                     ui,
                     "Committed",
-                    &format!(
-                        "{} / {}",
-                        format::format_bytes(m.commit_used_bytes),
-                        format::format_bytes(m.commit_limit_bytes)
-                    ),
+                    &m.commit_used_bytes
+                        .map(format::format_bytes)
+                        .zip(m.commit_limit_bytes.map(format::format_bytes))
+                        .map(|(used, limit)| format!("{} / {}", used, limit))
+                        .unwrap_or_else(|| "N/A".into()),
                 );
                 let pagefile = match (m.page_file_used_bytes, m.page_file_total_bytes) {
                     (Some(used), Some(total)) => format!(

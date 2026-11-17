@@ -1,7 +1,8 @@
 #[derive(Debug, Clone, Default)]
 pub struct CpuSnapshot {
     pub name: String,
-    pub total_utilization: f32,
+    pub vendor: String,
+    pub total_utilization: Option<f32>,
     pub physical_cores: u32,
     pub logical_processors: u32,
     pub sockets: u32,
@@ -15,5 +16,5 @@ pub struct CpuSnapshot {
 pub struct LogicalProcessorUsage {
     pub index: u32,
     pub physical_core_index: u32,
-    pub utilization: f32,
+    pub utilization: Option<f32>,
 }

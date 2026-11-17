@@ -1,13 +1,15 @@
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use crossbeam_channel::{Receiver, Sender, bounded};
 
-use crate::domain::SystemSnapshot;
+use crate::domain::{CollectorWarning, DataStatus, StorageSnapshot, SystemSnapshot};
+use crate::error::CollectorError;
 
 use super::collector::Collector;
 use super::messages::{MonitorCommand, MonitorEvent};
-use super::mock::MockCollector;
+#[cfg(target_os = "windows")]
+use crate::platform::windows::collector::WindowsCollector;
 
 pub struct MonitoringService {
     command_tx: Sender<MonitorCommand>,
@@ -17,7 +19,23 @@ pub struct MonitoringService {
 
 impl MonitoringService {
     pub fn start(initial_interval: Duration) -> Self {
-        Self::with_collector(Box::new(MockCollector::new()), initial_interval)
+        #[cfg(target_os = "windows")]
+        match WindowsCollector::new() {
+            Ok(collector) => Self::with_collector(Box::new(collector), initial_interval),
+            Err(error) => Self::with_collector(
+                Box::new(UnavailableCollector {
+                    message: error.to_string(),
+                }),
+                initial_interval,
+            ),
+        }
+        #[cfg(not(target_os = "windows"))]
+        Self::with_collector(
+            Box::new(UnavailableCollector {
+                message: "Hardware collection is only supported on Windows".into(),
+            }),
+            initial_interval,
+        )
     }
 
     pub fn with_collector(collector: Box<dyn Collector>, initial_interval: Duration) -> Self {
@@ -71,6 +89,28 @@ impl Drop for MonitoringService {
     }
 }
 
+struct UnavailableCollector {
+    message: String,
+}
+
+impl Collector for UnavailableCollector {
+    fn collect(&mut self, sequence: u64) -> Result<SystemSnapshot, CollectorError> {
+        Ok(SystemSnapshot {
+            sequence,
+            captured_at: SystemTime::now(),
+            status: DataStatus::Unavailable,
+            cpu: Default::default(),
+            memory: Default::default(),
+            gpus: Vec::new(),
+            storage: StorageSnapshot::default(),
+            warnings: vec![CollectorWarning {
+                source: "Windows hardware".into(),
+                message: self.message.clone(),
+            }],
+        })
+    }
+}
+
 fn run_worker(
     mut collector: Box<dyn Collector>,
     command_rx: Receiver<MonitorCommand>,
@@ -90,7 +130,6 @@ fn run_worker(
             match collector.collect(sequence) {
                 Ok(snapshot) => {
                     let mut event = MonitorEvent::Snapshot(Box::new(snapshot));
-                    // Bounded channel: if full, drop the oldest snapshot and retry once.
                     if let Err(crossbeam_channel::TrySendError::Full(returned)) =
                         event_tx.try_send(event)
                     {
@@ -99,16 +138,16 @@ fn run_worker(
                         let _ = event_tx.try_send(event);
                     }
                 }
-                Err(e) => {
-                    tracing::warn!("collector error: {e}");
+                Err(error) => {
+                    tracing::warn!("collector error: {error}");
                 }
             }
-            next_tick = now + interval;
+            next_tick = Instant::now() + interval;
         }
 
         match command_rx.recv_timeout(Duration::from_millis(10)) {
-            Ok(MonitorCommand::SetInterval(d)) => {
-                interval = d;
+            Ok(MonitorCommand::SetInterval(duration)) => {
+                interval = duration;
                 next_tick = Instant::now();
             }
             Ok(MonitorCommand::SetPaused(value)) => {

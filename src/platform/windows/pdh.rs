@@ -1,14 +1,11 @@
-use std::ffi::OsStr;
-use std::os::windows::ffi::OsStrExt;
-use std::os::windows::ffi::OsStringExt;
 use std::ptr;
 
 use windows::Win32::System::Performance::{
-    PdhAddEnglishCounterW, PdhCloseQuery, PdhCollectQueryData, PdhCollectQueryDataWithTime,
-    PdhGetFormattedCounterArrayW, PdhOpenQueryW, PdhValidatePathW,
-    PDH_FMT_COUNTERVALUE_ITEM_W, PDH_FMT_DOUBLE,
-    PDH_HQUERY, PDH_HCOUNTER,
+    PDH_CSTATUS_VALID_DATA, PDH_FMT_COUNTERVALUE, PDH_FMT_COUNTERVALUE_ITEM_W, PDH_FMT_DOUBLE,
+    PDH_HCOUNTER, PDH_HQUERY, PDH_MORE_DATA, PdhAddEnglishCounterW, PdhCloseQuery,
+    PdhCollectQueryData, PdhGetFormattedCounterArrayW, PdhGetFormattedCounterValue, PdhOpenQueryW,
 };
+use windows::core::{PCWSTR, PWSTR};
 
 use crate::error::CollectorError;
 
@@ -16,46 +13,37 @@ pub struct PdhQuery {
     handle: PDH_HQUERY,
 }
 
+// PDH query handles may move between threads; access remains serialized by &self/&mut collector.
+unsafe impl Send for PdhQuery {}
+
 impl PdhQuery {
     pub fn new() -> Result<Self, CollectorError> {
         let mut handle = PDH_HQUERY::default();
         let status = unsafe { PdhOpenQueryW(None, 0, &mut handle) };
-        if status != 0 {
-            return Err(CollectorError::Pdh(format!("PdhOpenQueryW failed: 0x{:X}", status)));
-        }
+        check(status, "PdhOpenQueryW")?;
         Ok(Self { handle })
     }
 
     pub fn add_counter(&self, path: &str) -> Result<PdhCounter, CollectorError> {
-        let path_wide: Vec<u16> = OsStr::new(path).encode_wide().chain(Some(0)).collect();
-        let mut counter_handle = PDH_HCOUNTER::default();
-        let status = unsafe { PdhAddEnglishCounterW(self.handle, windows::core::PCWSTR(path_wide.as_ptr()), 0, &mut counter_handle) };
-        if status != 0 {
-            return Err(CollectorError::Pdh(format!("PdhAddEnglishCounterW failed for {}: 0x{:X}", path, status)));
-        }
-        Ok(PdhCounter { handle: counter_handle })
+        let path = wide(path);
+        let mut handle = PDH_HCOUNTER::default();
+        let status =
+            unsafe { PdhAddEnglishCounterW(self.handle, PCWSTR(path.as_ptr()), 0, &mut handle) };
+        check(status, "PdhAddEnglishCounterW")?;
+        Ok(PdhCounter { handle })
     }
 
     pub fn collect(&self) -> Result<(), CollectorError> {
-        let status = unsafe { PdhCollectQueryData(self.handle) };
-        if status != 0 {
-            return Err(CollectorError::Pdh(format!("PdhCollectQueryData failed: 0x{:X}", status)));
-        }
-        Ok(())
-    }
-
-    pub fn collect_with_time(&self) -> Result<u64, CollectorError> {
-        let mut timestamp = 0i64;
-        let status = unsafe { PdhCollectQueryDataWithTime(self.handle, &mut timestamp) };
-        if status != 0 {
-            return Err(CollectorError::Pdh(format!("PdhCollectQueryDataWithTime failed: 0x{:X}", status)));
-        }
-        Ok(timestamp as u64)
+        check(
+            unsafe { PdhCollectQueryData(self.handle) },
+            "PdhCollectQueryData",
+        )
     }
 }
 
 impl Drop for PdhQuery {
     fn drop(&mut self) {
+        // SAFETY: the query handle is owned by this object and closed exactly once.
         unsafe { PdhCloseQuery(self.handle) };
     }
 }
@@ -64,97 +52,93 @@ pub struct PdhCounter {
     handle: PDH_HCOUNTER,
 }
 
+// PDH counter handles may move between threads; access remains serialized by &self/&mut collector.
+unsafe impl Send for PdhCounter {}
+
 impl PdhCounter {
     pub fn get_double(&self) -> Result<f64, CollectorError> {
-        let mut buffer_size = 0u32;
-        let mut item_count = 0u32;
-        let status = unsafe {
-            PdhGetFormattedCounterArrayW(
-                self.handle,
-                PDH_FMT_DOUBLE,
-                &mut buffer_size,
-                &mut item_count,
-                ptr::null_mut(),
-            )
-        };
-        if status != 0 && status != 0x800007D2 {
-            return Err(CollectorError::Pdh(format!("PdhGetFormattedCounterArrayW size query failed: 0x{:X}", status)));
+        let mut value = PDH_FMT_COUNTERVALUE::default();
+        let status =
+            unsafe { PdhGetFormattedCounterValue(self.handle, PDH_FMT_DOUBLE, None, &mut value) };
+        check(status, "PdhGetFormattedCounterValue")?;
+        if value.CStatus != PDH_CSTATUS_VALID_DATA {
+            return Err(CollectorError::Unavailable(format!(
+                "counter status 0x{:X}",
+                value.CStatus
+            )));
         }
-
-        let mut buffer = vec![0u8; buffer_size as usize];
-        let status = unsafe {
-            PdhGetFormattedCounterArrayW(
-                self.handle,
-                PDH_FMT_DOUBLE,
-                &mut buffer_size,
-                &mut item_count,
-                buffer.as_mut_ptr() as *mut _,
-            )
-        };
-        if status != 0 {
-            return Err(CollectorError::Pdh(format!("PdhGetFormattedCounterArrayW failed: 0x{:X}", status)));
-        }
-
-        if item_count == 0 {
-            return Err(CollectorError::Pdh("No counter data available".into()));
-        }
-
-        let item = unsafe { &*(buffer.as_ptr() as *const PDH_FMT_COUNTERVALUE_ITEM_W) };
-        Ok(unsafe { item.FmtValue.Anonymous.doubleValue })
+        // SAFETY: PDH_FMT_DOUBLE selects the double member of the union.
+        Ok(unsafe { value.Anonymous.doubleValue })
     }
 
     pub fn get_instance_values(&self) -> Result<Vec<(String, f64)>, CollectorError> {
-        let mut buffer_size = 0u32;
-        let mut item_count = 0u32;
+        let mut bytes = 0;
+        let mut count = 0;
         let status = unsafe {
             PdhGetFormattedCounterArrayW(
                 self.handle,
                 PDH_FMT_DOUBLE,
-                &mut buffer_size,
-                &mut item_count,
-                ptr::null_mut(),
+                &mut bytes,
+                &mut count,
+                Some(ptr::null_mut()),
             )
         };
-        if status != 0 && status != 0x800007D2 {
-            return Err(CollectorError::Pdh(format!("PdhGetFormattedCounterArrayW size query failed: 0x{:X}", status)));
+        if status != PDH_MORE_DATA {
+            check(status, "PdhGetFormattedCounterArrayW (size)")?;
+        }
+        if bytes == 0 {
+            return Ok(Vec::new());
         }
 
-        let mut buffer = vec![0u8; buffer_size as usize];
+        let mut buffer = vec![0_u8; bytes as usize];
         let status = unsafe {
             PdhGetFormattedCounterArrayW(
                 self.handle,
                 PDH_FMT_DOUBLE,
-                &mut buffer_size,
-                &mut item_count,
-                buffer.as_mut_ptr() as *mut _,
+                &mut bytes,
+                &mut count,
+                Some(buffer.as_mut_ptr().cast()),
             )
         };
-        if status != 0 {
-            return Err(CollectorError::Pdh(format!("PdhGetFormattedCounterArrayW failed: 0x{:X}", status)));
-        }
+        check(status, "PdhGetFormattedCounterArrayW")?;
 
-        let mut results = Vec::new();
-        let items = unsafe { std::slice::from_raw_parts(buffer.as_ptr() as *const PDH_FMT_COUNTERVALUE_ITEM_W, item_count as usize) };
-        for item in items {
-            let name_ptr = item.szName;
-            if name_ptr.is_null() {
-                continue;
-            }
-            let name = unsafe { std::ffi::OsString::from_wide(
-                std::slice::from_raw_parts(name_ptr.0, (0..).take_while(|&i| unsafe { *name_ptr.0.add(i) } != 0).count())
-            ).to_string_lossy().into_owned() };
-            let value = unsafe { item.FmtValue.Anonymous.doubleValue };
-            results.push((name, value));
-        }
-        Ok(results)
+        // SAFETY: PDH returned `count` contiguous wide counter items in this buffer.
+        let items = unsafe {
+            std::slice::from_raw_parts(
+                buffer.as_ptr().cast::<PDH_FMT_COUNTERVALUE_ITEM_W>(),
+                count as usize,
+            )
+        };
+        Ok(items
+            .iter()
+            .filter(|item| item.FmtValue.CStatus == PDH_CSTATUS_VALID_DATA)
+            .filter_map(|item| {
+                let name = pwstr_to_string(item.szName)?;
+                // SAFETY: PDH_FMT_DOUBLE selects the double member of the union.
+                Some((name, unsafe { item.FmtValue.Anonymous.doubleValue }))
+            })
+            .collect())
     }
 }
 
-pub fn validate_counter_path(path: &str) -> Result<(), CollectorError> {
-    let path_wide: Vec<u16> = OsStr::new(path).encode_wide().chain(Some(0)).collect();
-    let status = unsafe { PdhValidatePathW(windows::core::PCWSTR(path_wide.as_ptr())) };
-    if status != 0 {
-        return Err(CollectorError::Pdh(format!("PdhValidatePathW failed for {}: 0x{:X}", path, status)));
+fn pwstr_to_string(value: PWSTR) -> Option<String> {
+    if value.is_null() {
+        return None;
     }
-    Ok(())
+    // SAFETY: PDH supplies a null-terminated string whose lifetime is the result buffer.
+    Some(unsafe { value.to_string().ok()? })
+}
+
+fn wide(value: &str) -> Vec<u16> {
+    value.encode_utf16().chain(Some(0)).collect()
+}
+
+fn check(status: u32, operation: &str) -> Result<(), CollectorError> {
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(CollectorError::Pdh(format!(
+            "{operation} failed: 0x{status:X}"
+        )))
+    }
 }
