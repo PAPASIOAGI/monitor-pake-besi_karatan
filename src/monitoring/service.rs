@@ -3,7 +3,9 @@ use std::time::{Duration, Instant, SystemTime};
 
 use crossbeam_channel::{Receiver, Sender, bounded};
 
-use crate::domain::{CollectorWarning, DataStatus, StorageSnapshot, SystemSnapshot};
+use crate::domain::{
+    CollectorWarning, DataStatus, ProcessSnapshot, StorageSnapshot, SystemSnapshot,
+};
 use crate::error::CollectorError;
 
 use super::collector::Collector;
@@ -18,9 +20,9 @@ pub struct MonitoringService {
 }
 
 impl MonitoringService {
-    pub fn start(initial_interval: Duration) -> Self {
+    pub fn start(initial_interval: Duration, active_core_threshold: f32) -> Self {
         #[cfg(target_os = "windows")]
-        match WindowsCollector::new() {
+        match WindowsCollector::new(active_core_threshold) {
             Ok(collector) => Self::with_collector(Box::new(collector), initial_interval),
             Err(error) => Self::with_collector(
                 Box::new(UnavailableCollector {
@@ -103,6 +105,7 @@ impl Collector for UnavailableCollector {
             memory: Default::default(),
             gpus: Vec::new(),
             storage: StorageSnapshot::default(),
+            processes: ProcessSnapshot::default(),
             warnings: vec![CollectorWarning {
                 source: "Windows hardware".into(),
                 message: self.message.clone(),

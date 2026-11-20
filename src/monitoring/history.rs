@@ -32,6 +32,7 @@ impl HistoryBuffer {
         self.entries.is_empty()
     }
 
+    #[allow(dead_code)]
     pub fn value_at_x(&self, rect: egui::Rect, x: f32) -> Option<f32> {
         if self.entries.is_empty() || rect.width() <= 0.0 {
             return None;
@@ -39,6 +40,19 @@ impl HistoryBuffer {
         let ratio = ((x - rect.left()) / rect.width()).clamp(0.0, 1.0);
         let index = (ratio * (self.entries.len() - 1) as f32).round() as usize;
         self.entries.get(index).copied()
+    }
+
+    pub fn set_capacity(&mut self, capacity: usize) {
+        let new_capacity = capacity.max(2);
+        if new_capacity != self.entries.capacity() {
+            let mut new_entries = VecDeque::with_capacity(new_capacity);
+            let to_keep = self.entries.len().min(new_capacity);
+            if to_keep > 0 {
+                let start = self.entries.len().saturating_sub(to_keep);
+                new_entries.extend(self.entries.range(start..));
+            }
+            self.entries = new_entries;
+        }
     }
 }
 

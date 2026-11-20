@@ -6,6 +6,7 @@ use crate::config::AppConfig;
 use crate::domain::SystemSnapshot;
 use crate::monitoring::{HistoryBuffer, MonitoringService};
 use crate::ui;
+use crate::ui::widgets::AdvancedChartState;
 
 pub struct MonitorApp {
     config: AppConfig,
@@ -14,6 +15,7 @@ pub struct MonitorApp {
     history: AppHistory,
     active_page: ui::Page,
     paused: bool,
+    chart_state: AdvancedChartState,
 }
 
 struct AppHistory {
@@ -29,7 +31,7 @@ impl MonitorApp {
         let capacity =
             (config.history_duration_secs * 1000 / config.sampling_interval_ms.max(1)) as usize;
         Self {
-            service: MonitoringService::start(interval),
+            service: MonitoringService::start(interval, config.active_core_threshold_percent),
             config,
             latest: None,
             history: AppHistory {
@@ -39,6 +41,7 @@ impl MonitorApp {
             },
             active_page: ui::Page::Overview,
             paused: false,
+            chart_state: AdvancedChartState::default(),
         }
     }
 }
@@ -67,9 +70,20 @@ impl eframe::App for MonitorApp {
             &self.history.gpu,
             &mut self.config,
             self.paused,
+            &mut self.chart_state,
         );
         if let Some(ms) = actions.new_interval_ms {
             self.service.set_interval(Duration::from_millis(ms));
+            let capacity = (self.config.history_duration_secs * 1000 / ms.max(1)) as usize;
+            self.history.cpu.set_capacity(capacity);
+            self.history.ram.set_capacity(capacity);
+            self.history.gpu.set_capacity(capacity);
+        }
+        if let Some(secs) = actions.new_history_secs {
+            let capacity = (secs * 1000 / self.config.sampling_interval_ms.max(1)) as usize;
+            self.history.cpu.set_capacity(capacity);
+            self.history.ram.set_capacity(capacity);
+            self.history.gpu.set_capacity(capacity);
         }
         if let Some(paused) = actions.paused {
             self.paused = paused;

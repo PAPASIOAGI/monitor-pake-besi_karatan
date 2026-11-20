@@ -10,6 +10,7 @@ pub struct CpuSnapshot {
     pub per_logical: Vec<LogicalProcessorUsage>,
     pub base_clock_mhz: Option<u32>,
     pub current_clock_mhz: Option<u32>,
+    pub temperature_celsius: Option<f32>,
 }
 
 #[derive(Debug, Clone)]

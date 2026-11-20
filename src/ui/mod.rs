@@ -2,10 +2,12 @@ mod cpu_page;
 mod dashboard;
 mod gpu_page;
 mod memory_page;
+mod processes_page;
 mod settings_page;
+mod storage_analyzer_page;
 mod storage_page;
 pub mod theme;
-mod widgets;
+pub mod widgets;
 
 pub use theme::apply as apply_theme;
 
@@ -14,10 +16,12 @@ use egui::{Context, RichText, SidePanel, TopBottomPanel};
 use crate::config::AppConfig;
 use crate::domain::SystemSnapshot;
 use crate::monitoring::HistoryBuffer;
+use crate::ui::widgets::AdvancedChartState;
 
 #[derive(Default)]
 pub struct UiActions {
     pub new_interval_ms: Option<u64>,
+    pub new_history_secs: Option<u64>,
     pub paused: Option<bool>,
     pub theme_changed: bool,
 }
@@ -29,7 +33,8 @@ pub enum Page {
     Memory,
     Gpu,
     Storage,
-    DiskUsage,
+    Processes,
+    StorageAnalyzer,
     Settings,
 }
 
@@ -41,7 +46,8 @@ impl Page {
             Self::Memory => "Memory",
             Self::Gpu => "GPU",
             Self::Storage => "Storage",
-            Self::DiskUsage => "Disk usage",
+            Self::Processes => "Processes",
+            Self::StorageAnalyzer => "Storage Analyzer",
             Self::Settings => "Settings",
         }
     }
@@ -57,6 +63,7 @@ pub fn render(
     gpu_history: &HistoryBuffer,
     config: &mut AppConfig,
     paused: bool,
+    chart_state: &mut AdvancedChartState,
 ) -> UiActions {
     let mut actions = UiActions::default();
 
@@ -83,9 +90,13 @@ pub fn render(
                 nav_item(ui, active_page, page);
             }
             ui.add_space(20.0);
-            nav_group(ui, "ANALYZE");
-            nav_item(ui, active_page, Page::DiskUsage);
+            nav_group(ui, "ACTIVITY");
+            nav_item(ui, active_page, Page::Processes);
+            ui.add_space(20.0);
+            nav_group(ui, "ANALYSIS");
+            nav_item(ui, active_page, Page::StorageAnalyzer);
             ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
+                nav_group(ui, "PREFERENCES");
                 nav_item(ui, active_page, Page::Settings);
             });
         });
@@ -176,12 +187,15 @@ pub fn render(
                         ram_history,
                         gpu_history,
                         config.history_duration_secs,
+                        chart_state,
+                        config,
                     ),
                     Page::Cpu => cpu_page::show(ui, snapshot, config.active_core_threshold_percent),
                     Page::Memory => memory_page::show(ui, snapshot),
                     Page::Gpu => gpu_page::show(ui, snapshot),
                     Page::Storage => storage_page::show(ui, snapshot),
-                    Page::DiskUsage => disk_usage(ui),
+                    Page::Processes => processes_page::show(ui, snapshot),
+                    Page::StorageAnalyzer => storage_analyzer_page::show(ui, &mut actions),
                     Page::Settings => settings_page::show(ui, config, &mut actions),
                 });
         });
@@ -218,31 +232,4 @@ fn status_badge(ui: &mut egui::Ui, paused: bool, has_data: bool) {
         ("Starting", theme::MUTED)
     };
     ui.label(RichText::new(text).size(12.0).strong().color(color));
-}
-
-fn disk_usage(ui: &mut egui::Ui) {
-    widgets::panel(ui, |ui| {
-        widgets::section_heading(ui, "Understand what consumes space");
-        ui.add_space(8.0);
-        ui.label(
-            RichText::new("Choose a drive or folder to scan. Scanning reads file metadata only.")
-                .color(theme::SECONDARY),
-        );
-        ui.add_space(20.0);
-        ui.horizontal(|ui| {
-            ui.add(
-                egui::TextEdit::singleline(&mut String::new())
-                    .hint_text("Select a folder…")
-                    .desired_width(420.0),
-            );
-            ui.add_enabled(false, egui::Button::new("Browse"));
-            ui.add_enabled(false, egui::Button::new("Start scan"));
-        });
-        ui.add_space(12.0);
-        ui.label(
-            RichText::new("Storage Analyzer will be available in the next development stage.")
-                .size(12.0)
-                .color(theme::MUTED),
-        );
-    });
 }

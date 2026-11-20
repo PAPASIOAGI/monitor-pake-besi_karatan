@@ -4,4 +4,6 @@ pub mod disk;
 pub mod gpu;
 pub mod memory;
 pub mod pdh;
+pub mod process;
+pub mod sensors;
 pub mod volume;

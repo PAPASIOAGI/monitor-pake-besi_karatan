@@ -37,10 +37,11 @@ pub struct CpuCollector {
     name: String,
     vendor: String,
     base_clock_mhz: Option<u32>,
+    active_core_threshold: f32,
 }
 
 impl CpuCollector {
-    pub fn new() -> Result<Self, CollectorError> {
+    pub fn new(active_core_threshold: f32) -> Result<Self, CollectorError> {
         let query = PdhQuery::new()?;
         let total = query.add_counter(r"\Processor Information(_Total)\% Processor Utility")?;
         let logical = query
@@ -60,6 +61,7 @@ impl CpuCollector {
             name: identity.0,
             vendor: identity.1,
             base_clock_mhz: identity.2,
+            active_core_threshold,
         })
     }
 
@@ -115,7 +117,7 @@ impl CpuCollector {
                     .iter()
                     .filter(|logical| logical.physical_core_index == *core as u32)
                     .filter_map(|logical| logical.utilization)
-                    .any(|usage| usage > 5.0)
+                    .any(|usage| usage > self.active_core_threshold)
             })
             .count() as u32;
 
@@ -130,6 +132,7 @@ impl CpuCollector {
             per_logical,
             base_clock_mhz: self.base_clock_mhz,
             current_clock_mhz,
+            temperature_celsius: None, // Will be set by WindowsCollector if sensor available
         })
     }
 }

@@ -7,6 +7,8 @@ use windows::Win32::Graphics::Dxgi::{
 use crate::domain::{GpuEngine, GpuEngineKind, GpuSnapshot};
 use crate::error::CollectorError;
 use crate::platform::windows::pdh::{PdhCounter, PdhQuery};
+use crate::platform::windows::sensors::TemperatureSensor;
+use crate::platform::windows::sensors::gpu_temp::GpuTemperatureSensor;
 
 struct Adapter {
     name: String,
@@ -16,6 +18,7 @@ struct Adapter {
     luid: i64,
     dedicated_total: u64,
     shared_total: u64,
+    temp_sensor: Option<GpuTemperatureSensor>,
 }
 
 pub struct GpuCollector {
@@ -65,9 +68,14 @@ impl GpuCollector {
 
         Ok(self
             .adapters
-            .iter()
+            .iter_mut()
             .map(|adapter| {
                 let (engines, total) = aggregate_engines(&engine_values, adapter.luid);
+                let temperature = adapter
+                    .temp_sensor
+                    .as_mut()
+                    .and_then(|sensor| sensor.read_temperature().ok().flatten())
+                    .map(|t| t.0);
                 GpuSnapshot {
                     name: adapter.name.clone(),
                     vendor: adapter.vendor.clone(),
@@ -81,7 +89,7 @@ impl GpuCollector {
                     dedicated_vram_used_bytes: memory_usage(&dedicated_values, adapter.luid),
                     shared_memory_total_bytes: Some(adapter.shared_total),
                     shared_memory_used_bytes: memory_usage(&shared_values, adapter.luid),
-                    temperature_celsius: None,
+                    temperature_celsius: temperature,
                     core_clock_mhz: None,
                     memory_clock_mhz: None,
                     power_watts: None,
@@ -110,14 +118,17 @@ fn enumerate_adapters() -> Result<Vec<Adapter>, CollectorError> {
             .split(|character| *character == 0)
             .next()
             .unwrap_or_default();
+        let luid = ((desc.AdapterLuid.HighPart as i64) << 32) | desc.AdapterLuid.LowPart as i64;
+        let temp_sensor = GpuTemperatureSensor::new(luid, desc.VendorId);
         adapters.push(Adapter {
             name: String::from_utf16_lossy(description),
             vendor: vendor_name(desc.VendorId).into(),
             vendor_id: desc.VendorId,
             device_id: desc.DeviceId,
-            luid: ((desc.AdapterLuid.HighPart as i64) << 32) | desc.AdapterLuid.LowPart as i64,
+            luid,
             dedicated_total: desc.DedicatedVideoMemory as u64,
             shared_total: desc.SharedSystemMemory as u64,
+            temp_sensor: Some(temp_sensor),
         });
     }
     Ok(adapters)

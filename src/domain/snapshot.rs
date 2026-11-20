@@ -1,6 +1,8 @@
 use std::time::SystemTime;
 
-use super::{CpuSnapshot, DataStatus, GpuSnapshot, MemorySnapshot, StorageSnapshot};
+use super::{
+    CpuSnapshot, DataStatus, GpuSnapshot, MemorySnapshot, ProcessSnapshot, StorageSnapshot,
+};
 
 #[derive(Debug, Clone)]
 pub struct SystemSnapshot {
@@ -12,6 +14,7 @@ pub struct SystemSnapshot {
     pub memory: MemorySnapshot,
     pub gpus: Vec<GpuSnapshot>,
     pub storage: StorageSnapshot,
+    pub processes: ProcessSnapshot,
     #[allow(dead_code)] // populated once real collectors emit warnings
     pub warnings: Vec<CollectorWarning>,
 }

@@ -3,6 +3,7 @@ use egui::{Color32, Pos2, Sense, Stroke, Ui, Vec2};
 use crate::monitoring::HistoryBuffer;
 use crate::ui::theme;
 
+#[allow(dead_code)]
 pub fn time_series_chart(
     ui: &mut Ui,
     series: &[(&str, &HistoryBuffer, Color32)],

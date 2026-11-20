@@ -3,9 +3,13 @@ use std::time::SystemTime;
 use crate::domain::{CollectorWarning, DataStatus, StorageSnapshot, SystemSnapshot};
 use crate::error::CollectorError;
 use crate::monitoring::collector::Collector;
+use crate::platform::windows::sensors::cpu_temp::create_cpu_temperature_sensor;
 
 use super::volume::VolumeCollector;
-use super::{cpu::CpuCollector, disk::DiskCollector, gpu::GpuCollector, memory::MemoryCollector};
+use super::{
+    cpu::CpuCollector, disk::DiskCollector, gpu::GpuCollector, memory::MemoryCollector,
+    process::ProcessCollector,
+};
 
 pub struct WindowsCollector {
     cpu: Option<CpuCollector>,
@@ -13,17 +17,36 @@ pub struct WindowsCollector {
     gpu: Option<GpuCollector>,
     volume: Option<VolumeCollector>,
     disk: Option<DiskCollector>,
+    process: Option<ProcessCollector>,
+    cpu_temp_sensor: Option<Box<dyn crate::platform::windows::sensors::TemperatureSensor>>,
     warnings: Vec<CollectorWarning>,
 }
 
 impl WindowsCollector {
-    pub fn new() -> Result<Self, CollectorError> {
+    pub fn new(active_core_threshold: f32) -> Result<Self, CollectorError> {
         let mut warnings = Vec::new();
-        let cpu = initialize("CPU", CpuCollector::new(), &mut warnings);
+        let cpu = initialize(
+            "CPU",
+            CpuCollector::new(active_core_threshold),
+            &mut warnings,
+        );
         let memory = initialize("Memory", MemoryCollector::new(), &mut warnings);
         let gpu = initialize("GPU", GpuCollector::new(), &mut warnings);
         let volume = initialize("Volumes", VolumeCollector::new(), &mut warnings);
         let disk = initialize("Physical disks", DiskCollector::new(), &mut warnings);
+        let process = initialize("Processes", ProcessCollector::new(), &mut warnings);
+
+        // Initialize CPU temperature sensor
+        let cpu_temp_sensor = create_cpu_temperature_sensor();
+        if !cpu_temp_sensor.name().contains("Unavailable") {
+            // Sensor is available
+        } else {
+            warnings.push(CollectorWarning {
+                source: "CPU Temperature".into(),
+                message: "No CPU temperature sensor available".into(),
+            });
+        }
+
         if cpu.is_none() && memory.is_none() {
             return Err(CollectorError::Unavailable(
                 "CPU and memory monitoring could not initialize".into(),
@@ -35,6 +58,8 @@ impl WindowsCollector {
             gpu,
             volume,
             disk,
+            process,
+            cpu_temp_sensor: Some(cpu_temp_sensor),
             warnings,
         })
     }
@@ -42,13 +67,21 @@ impl WindowsCollector {
 
 impl Collector for WindowsCollector {
     fn collect(&mut self, sequence: u64) -> Result<SystemSnapshot, CollectorError> {
-        let cpu = collect_part(
+        let mut cpu = collect_part(
             "CPU",
             &mut self.cpu,
             CpuCollector::collect,
             &mut self.warnings,
         )
         .unwrap_or_default();
+
+        // Read CPU temperature
+        if let Some(sensor) = &mut self.cpu_temp_sensor
+            && let Ok(Some(temp)) = sensor.read_temperature()
+        {
+            cpu.temperature_celsius = Some(temp.0);
+        }
+
         let memory = collect_part(
             "Memory",
             &mut self.memory,
@@ -77,6 +110,13 @@ impl Collector for WindowsCollector {
             &mut self.warnings,
         )
         .unwrap_or_default();
+        let processes = collect_part(
+            "Processes",
+            &mut self.process,
+            ProcessCollector::collect,
+            &mut self.warnings,
+        )
+        .unwrap_or_default();
         let status = if self.cpu.is_none() || self.memory.is_none() {
             DataStatus::Unavailable
         } else {
@@ -93,6 +133,7 @@ impl Collector for WindowsCollector {
                 physical_disks,
                 volumes,
             },
+            processes,
             warnings: self.warnings.clone(),
         })
     }
